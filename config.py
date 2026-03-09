@@ -4,6 +4,12 @@ Shared configuration for the modular RadCopilot refactor.
 This module centralizes runtime defaults, path resolution, and environment
 overrides so that the launcher, server, RAG, logging, and service layers all
 use one source of truth.
+
+This file is intended to live at:
+
+    radcopilot/config.py
+
+That means the real project root is one directory above this file.
 """
 
 from __future__ import annotations
@@ -12,6 +18,14 @@ import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
+
+
+DEFAULT_APP_NAME = "RadCopilot Local"
+DEFAULT_VERSION = "0.1.0"
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = 7432
+DEFAULT_OLLAMA_URL = "http://localhost:11434"
+DEFAULT_OLLAMA_MODEL = "llama3.1:8b"
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -51,17 +65,22 @@ def _env_list(name: str, default: Iterable[str]) -> List[str]:
 def _env_path(name: str, default: Path) -> Path:
     value = os.getenv(name)
     if value is None or not value.strip():
-        return default
+        return default.resolve()
     return Path(value).expanduser().resolve()
 
 
 def _project_root() -> Path:
-    return Path(__file__).resolve().parent
+    """
+    This file lives at radcopilot/config.py, so the repository root is one
+    directory above this file.
+    """
+    return Path(__file__).resolve().parent.parent
 
 
 @dataclass(slots=True)
 class AppPaths:
     project_root: Path
+    package_dir: Path
     ui_dir: Path
     data_dir: Path
     logs_dir: Path
@@ -75,6 +94,7 @@ class AppPaths:
 
     def ensure_dirs(self) -> None:
         for path in {
+            self.package_dir,
             self.ui_dir,
             self.data_dir,
             self.logs_dir,
@@ -84,7 +104,7 @@ class AppPaths:
         }:
             path.mkdir(parents=True, exist_ok=True)
 
-    def as_dict(self) -> Dict[str, str]:
+    def as_dict(self) -> Dict[str, Any]:
         payload = asdict(self)
         payload["dataset_search_roots"] = [str(p) for p in self.dataset_search_roots]
         return {
@@ -95,8 +115,8 @@ class AppPaths:
 
 @dataclass(slots=True)
 class OllamaSettings:
-    base_url: str = "http://localhost:11434"
-    default_model: str = "llama3.1:8b"
+    base_url: str = DEFAULT_OLLAMA_URL
+    default_model: str = DEFAULT_OLLAMA_MODEL
     generate_endpoint: str = "/api/generate"
     chat_endpoint: str = "/api/chat"
     tags_endpoint: str = "/api/tags"
@@ -143,8 +163,8 @@ class WhisperSettings:
 
 @dataclass(slots=True)
 class ServerSettings:
-    host: str = "127.0.0.1"
-    port: int = 7432
+    host: str = DEFAULT_HOST
+    port: int = DEFAULT_PORT
     open_browser: bool = True
     browser_open_delay_seconds: float = 1.0
     allow_reuse_address: bool = True
@@ -211,11 +231,68 @@ class AppConfig:
             "ui": self.ui.as_dict(),
         }
 
+    # ------------------------------------------------------------------
+    # Compatibility properties for modules that still expect the simpler
+    # launcher-style config shape from main.py.
+    # ------------------------------------------------------------------
+    @property
+    def base_dir(self) -> Path:
+        return self.paths.project_root
+
+    @property
+    def package_dir(self) -> Path:
+        return self.paths.package_dir
+
+    @property
+    def ui_dir(self) -> Path:
+        return self.paths.ui_dir
+
+    @property
+    def data_dir(self) -> Path:
+        return self.paths.data_dir
+
+    @property
+    def log_file(self) -> Path:
+        return self.paths.error_log_file
+
+    @property
+    def host(self) -> str:
+        return self.server.host
+
+    @property
+    def port(self) -> int:
+        return self.server.port
+
+    @property
+    def ollama_url(self) -> str:
+        return self.ollama.base_url.rstrip("/")
+
+    @property
+    def open_browser(self) -> bool:
+        return self.server.open_browser
+
+    @property
+    def browser_delay_seconds(self) -> float:
+        return self.server.browser_open_delay_seconds
+
+    @property
+    def auto_start_ollama(self) -> bool:
+        return self.ollama.auto_start
+
+    @property
+    def build_startup_rag(self) -> bool:
+        return self.rag.build_startup_index
+
+    @property
+    def base_url(self) -> str:
+        return f"http://{self.server.host}:{self.server.port}"
+
 
 def _default_dataset_roots(project_root: Path) -> List[Path]:
     home = Path.home()
     downloads = home / "Downloads"
     return [
+        project_root / "radcopilot_datasets",
         project_root / "data" / "datasets",
         downloads / "radcopilot_datasets",
         downloads,
@@ -224,12 +301,15 @@ def _default_dataset_roots(project_root: Path) -> List[Path]:
 
 def build_paths(project_root: Optional[Path] = None) -> AppPaths:
     root = (project_root or _project_root()).resolve()
-    data_dir = _env_path("RADCOPILOT_DATA_DIR", root / "data")
+    package_dir = root / "radcopilot"
+
+    data_dir = _env_path("RADCOPILOT_DATA_DIR", root / "radcopilot_datasets")
     logs_dir = _env_path("RADCOPILOT_LOGS_DIR", data_dir / "logs")
     rag_dir = _env_path("RADCOPILOT_RAG_DIR", data_dir / "rag")
     temp_dir = _env_path("RADCOPILOT_TEMP_DIR", data_dir / "tmp")
     benchmark_dir = _env_path("RADCOPILOT_BENCHMARK_DIR", data_dir / "benchmarks")
-    ui_dir = _env_path("RADCOPILOT_UI_DIR", root / "ui")
+    ui_dir = _env_path("RADCOPILOT_UI_DIR", package_dir / "ui")
+
     search_roots = [
         Path(p).expanduser().resolve()
         for p in _env_list(
@@ -240,12 +320,13 @@ def build_paths(project_root: Optional[Path] = None) -> AppPaths:
 
     return AppPaths(
         project_root=root,
+        package_dir=package_dir,
         ui_dir=ui_dir,
         data_dir=data_dir,
         logs_dir=logs_dir,
         rag_dir=rag_dir,
         temp_dir=temp_dir,
-        error_log_file=_env_path("RADCOPILOT_ERROR_LOG_FILE", logs_dir / "radcopilot_errors.jsonl"),
+        error_log_file=_env_path("RADCOPILOT_ERROR_LOG_FILE", root / "radcopilot_errors.jsonl"),
         rag_store_file=_env_path("RADCOPILOT_RAG_STORE_FILE", rag_dir / "rag_library.json"),
         rag_rating_file=_env_path("RADCOPILOT_RAG_RATING_FILE", rag_dir / "rag_ratings.jsonl"),
         benchmark_dir=benchmark_dir,
@@ -257,14 +338,14 @@ def load_config(project_root: Optional[Path] = None) -> AppConfig:
     paths = build_paths(project_root)
 
     config = AppConfig(
-        app_name=os.getenv("RADCOPILOT_APP_NAME", "RadCopilot Local"),
-        version=os.getenv("RADCOPILOT_VERSION", "0.1.0"),
+        app_name=os.getenv("RADCOPILOT_APP_NAME", DEFAULT_APP_NAME),
+        version=os.getenv("RADCOPILOT_VERSION", DEFAULT_VERSION),
         debug=_env_bool("RADCOPILOT_DEBUG", False),
         environment=os.getenv("RADCOPILOT_ENV", "local"),
         paths=paths,
         server=ServerSettings(
-            host=os.getenv("RADCOPILOT_HOST", "127.0.0.1"),
-            port=_env_int("RADCOPILOT_PORT", 7432),
+            host=os.getenv("RADCOPILOT_HOST", DEFAULT_HOST),
+            port=_env_int("RADCOPILOT_PORT", DEFAULT_PORT),
             open_browser=_env_bool("RADCOPILOT_OPEN_BROWSER", True),
             browser_open_delay_seconds=_env_float("RADCOPILOT_BROWSER_DELAY", 1.0),
             allow_reuse_address=_env_bool("RADCOPILOT_ALLOW_REUSE_ADDRESS", True),
@@ -272,8 +353,8 @@ def load_config(project_root: Optional[Path] = None) -> AppConfig:
             static_index=os.getenv("RADCOPILOT_STATIC_INDEX", "index.html"),
         ),
         ollama=OllamaSettings(
-            base_url=os.getenv("RADCOPILOT_OLLAMA_URL", "http://localhost:11434"),
-            default_model=os.getenv("RADCOPILOT_OLLAMA_MODEL", "llama3.1:8b"),
+            base_url=os.getenv("RADCOPILOT_OLLAMA_URL", DEFAULT_OLLAMA_URL).rstrip("/"),
+            default_model=os.getenv("RADCOPILOT_OLLAMA_MODEL", DEFAULT_OLLAMA_MODEL),
             generate_endpoint=os.getenv("RADCOPILOT_OLLAMA_GENERATE_ENDPOINT", "/api/generate"),
             chat_endpoint=os.getenv("RADCOPILOT_OLLAMA_CHAT_ENDPOINT", "/api/chat"),
             tags_endpoint=os.getenv("RADCOPILOT_OLLAMA_TAGS_ENDPOINT", "/api/tags"),
@@ -335,7 +416,13 @@ DEFAULT_CONFIG = load_config()
 __all__ = [
     "AppConfig",
     "AppPaths",
+    "DEFAULT_APP_NAME",
     "DEFAULT_CONFIG",
+    "DEFAULT_HOST",
+    "DEFAULT_OLLAMA_MODEL",
+    "DEFAULT_OLLAMA_URL",
+    "DEFAULT_PORT",
+    "DEFAULT_VERSION",
     "LoggingSettings",
     "OllamaSettings",
     "RagSettings",
