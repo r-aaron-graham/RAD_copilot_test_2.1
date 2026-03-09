@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>RadCopilot Local</title>
+    <link rel="stylesheet" href="./styles.css" />
+
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="panel left-rail">
+      <div class="panel-header brand">
+        <h1 id="appName">RadCopilot Local</h1>
+        <div class="subtle">Local-first radiology reporting workspace</div>
+      </div>
+      <div class="panel-body stack">
+        <div class="status-banner" id="appStatus" data-level="info">Ready.</div>
+
+        <div>
+          <label class="label" for="modeSelect">Mode</label>
+          <select id="modeSelect">
+            <option value="report">Report</option>
+            <option value="differential">Differential</option>
+            <option value="guideline">Guideline</option>
+          </select>
+        </div>
+
+        <div class="mode-toolbar">
+          <button type="button" data-mode="report" class="is-active">Report</button>
+          <button type="button" data-mode="differential">Differential</button>
+          <button type="button" data-mode="guideline">Guideline</button>
+        </div>
+
+        <div>
+          <label class="label" for="templateSelect">Template</label>
+          <select id="templateSelect"></select>
+        </div>
+
+        <div>
+          <label class="label" for="modelSelect">Model</label>
+          <select id="modelSelect">
+            <option value="llama3.1:8b">llama3.1:8b</option>
+            <option value="mistral:7b">mistral:7b</option>
+            <option value="qwen2.5:7b">qwen2.5:7b</option>
+          </select>
+          <div class="footer-note">Use the dropdown when tags are available, or enter a model manually.</div>
+        </div>
+
+        <div>
+          <label class="label" for="modelInput">Manual Model Override</label>
+          <input id="modelInput" type="text" placeholder="llama3.1:8b" />
+        </div>
+
+        <div class="checkbox-row">
+          <input id="useRagInput" type="checkbox" checked />
+          <label for="useRagInput">Use RAG examples during generation</label>
+        </div>
+
+        <div>
+          <label class="label" for="maxRagExamplesInput">Max RAG Examples</label>
+          <input id="maxRagExamplesInput" type="number" min="0" max="8" step="1" value="3" />
+        </div>
+
+        <div class="toolbar">
+          <button id="saveSettingsBtn" type="button">Save Settings</button>
+          <button id="refreshHealthBtn" type="button">Refresh Health</button>
+          <button id="refreshLogsBtn" type="button">Refresh Logs</button>
+        </div>
+
+        <div class="pill-grid">
+          <div class="pill"><strong>Server</strong><br><span id="serverStatus" class="muted small">-</span></div>
+          <div class="pill"><strong>Ollama URL</strong><br><span id="ollamaUrlStatus" class="muted small">-</span></div>
+          <div class="pill"><strong>Health</strong><br><span id="healthStatus" class="muted small">-</span></div>
+          <div class="pill"><strong>Ollama</strong><br><span id="ollamaStatus" class="muted small">-</span></div>
+        </div>
+
+        <div>
+          <div class="label">RAG Status</div>
+          <div id="ragStatus" class="code-block small">Loading...</div>
+        </div>
+
+        <div>
+          <div class="label">Checklist</div>
+          <ul id="checklistList" class="list"></ul>
+        </div>
+      </div>
+    </aside>
+
+    <main class="panel main-stage">
+      <div class="panel-header">
+        <div class="status-bar">
+          <div><strong>Template:</strong> <span id="templateLabel">-</span></div>
+          <div><strong>Report Status:</strong> <span id="reportStatus">IDLE</span></div>
+        </div>
+      </div>
+      <div class="panel-body stack">
+        <section data-mode-panel="report" class="stack">
+          <div class="row row-3">
+            <div>
+              <label class="label" for="ageInput">Age</label>
+              <input id="ageInput" type="text" placeholder="e.g. 64" />
+            </div>
+            <div>
+              <label class="label" for="sexInput">Sex</label>
+              <input id="sexInput" type="text" placeholder="e.g. F" />
+            </div>
+            <div>
+              <label class="label" for="indicationInput">Indication</label>
+              <input id="indicationInput" type="text" placeholder="Clinical indication" />
+            </div>
+          </div>
+
+          <div>
+            <label class="label" for="findingsInput">Findings</label>
+            <textarea id="findingsInput" placeholder="Enter or paste findings here..."></textarea>
+          </div>
+
+          <div class="toolbar">
+            <button id="generateReportBtn" class="primary" type="button">Generate Report</button>
+            <button id="cancelBtn" class="danger" type="button" style="display:none" hidden>Cancel</button>
+          </div>
+
+          <div class="row row-2">
+            <div>
+              <label class="label" for="templatePreview">Template Preview</label>
+              <textarea id="templatePreview" readonly></textarea>
+            </div>
+            <div>
+              <label class="label" for="impressionOutput">Impression</label>
+              <textarea id="impressionOutput" readonly></textarea>
+            </div>
+          </div>
+
+          <div>
+            <label class="label" for="reportOutput">Final Report</label>
+            <textarea id="reportOutput" readonly style="min-height: 260px;"></textarea>
+          </div>
+
+          <div class="row row-2">
+            <div>
+              <div class="label">Validation</div>
+              <pre id="validationOutput">No validation issues yet.</pre>
+            </div>
+            <div>
+              <div class="label">Trace</div>
+              <pre id="traceOutput">No trace output yet.</pre>
+            </div>
+          </div>
+        </section>
+
+        <section data-mode-panel="differential" class="stack" hidden style="display:none">
+          <div>
+            <label class="label" for="differentialOutput">Differential Output</label>
+            <textarea id="differentialOutput" readonly style="min-height: 320px;"></textarea>
+          </div>
+          <div class="toolbar">
+            <button id="runDifferentialBtn" class="primary" type="button">Run Differential</button>
+          </div>
+        </section>
+
+        <section data-mode-panel="guideline" class="stack" hidden style="display:none">
+          <div>
+            <label class="label" for="guidelineOutput">Guideline Output</label>
+            <textarea id="guidelineOutput" readonly style="min-height: 320px;"></textarea>
+          </div>
+          <div class="toolbar">
+            <button id="runGuidelineBtn" class="primary" type="button">Run Guideline Lookup</button>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <aside class="panel right-rail">
+      <div class="panel-header">
+        <strong>Operations</strong>
+      </div>
+      <div class="panel-body stack">
+        <div>
+          <div class="label">Train RAG</div>
+          <input id="trainPathInput" type="text" placeholder="File or directory path" />
+          <div class="toolbar" style="margin-top:10px;">
+            <button id="trainRagBtn" class="success" type="button">Train RAG</button>
+          </div>
+          <pre id="trainRagOutput">No training run yet.</pre>
+        </div>
+
+        <div>
+          <div class="label">Benchmark</div>
+          <input id="benchmarkPathInput" type="text" placeholder="Benchmark dataset path" />
+          <div class="toolbar" style="margin-top:10px;">
+            <button id="loadBenchmarkBtn" class="warn" type="button">Load Benchmark</button>
+          </div>
+          <div id="benchmarkDatasets" class="small muted">Loading datasets...</div>
+          <pre id="benchmarkOutput">No benchmark data loaded.</pre>
+        </div>
+
+        <div>
+          <div class="label">History</div>
+          <div id="historyList">No saved reports yet.</div>
+        </div>
+
+        <div>
+          <div class="label">Logs</div>
+          <div id="logsOutput">Loading logs...</div>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <script src="./templates.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>
