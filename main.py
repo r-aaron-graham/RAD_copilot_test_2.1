@@ -2,20 +2,21 @@
 """
 RadCopilot Local - modular entrypoint
 
-This file is the first GitHub-ready code file to begin refactoring the original
-single-file RadCopilot app into a modular local application.
+This file is intended to live at:
 
-Responsibilities of this entrypoint:
+    radcopilot/main.py
+
+Responsibilities:
 - load runtime configuration
 - perform crash-safe startup handling
 - verify or start Ollama
-- optionally bootstrap a startup RAG index if that module exists
-- resolve the HTTP handler from modular server code if available
+- optionally bootstrap a startup RAG index
+- resolve the HTTP handler from modular server code
 - fall back to a safe minimal handler if the rest of the package is not yet built
 - launch the local server and open the browser
 
-This file is intentionally self-contained so it can run before the rest of the
-refactor is finished.
+This file is intentionally self-contained so it can run while the rest of the
+refactor is still being completed.
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ import traceback
 import urllib.request
 import webbrowser
 from dataclasses import dataclass
-from typing import Callable, Optional, Type
+from typing import Optional, Type
 
 
 APP_NAME = "RadCopilot Local"
@@ -42,6 +43,10 @@ DEFAULT_PORT = 7432
 DEFAULT_OLLAMA_URL = "http://localhost:11434"
 DEFAULT_BROWSER_DELAY_SECONDS = 1.25
 DEFAULT_HOST = "127.0.0.1"
+
+# This file is expected to live in radcopilot/main.py, so the repository root
+# is one directory above this file.
+DEFAULT_BASE_DIR = Path(__file__).resolve().parent.parent
 
 
 @dataclass(slots=True)
@@ -56,10 +61,12 @@ class AppConfig:
     browser_delay_seconds: float = DEFAULT_BROWSER_DELAY_SECONDS
     auto_start_ollama: bool = True
     build_startup_rag: bool = True
-    base_dir: Path = Path(__file__).resolve().parent
-    ui_dir: Path = Path(__file__).resolve().parent / "ui"
-    log_file: Path = Path(__file__).resolve().parent / "radcopilot_errors.jsonl"
-    data_dir: Path = Path(__file__).resolve().parent / "radcopilot_datasets"
+
+    # Project-root-relative paths
+    base_dir: Path = DEFAULT_BASE_DIR
+    ui_dir: Path = DEFAULT_BASE_DIR / "radcopilot" / "ui"
+    log_file: Path = DEFAULT_BASE_DIR / "radcopilot_errors.jsonl"
+    data_dir: Path = DEFAULT_BASE_DIR / "radcopilot_datasets"
 
     @property
     def base_url(self) -> str:
@@ -68,11 +75,15 @@ class AppConfig:
     @classmethod
     def from_env(cls) -> "AppConfig":
         env = os.environ
-        base_dir = Path(env.get("RADCOPILOT_BASE_DIR", Path(__file__).resolve().parent)).resolve()
-        ui_dir = Path(env.get("RADCOPILOT_UI_DIR", base_dir / "ui")).resolve()
+
+        default_base_dir = DEFAULT_BASE_DIR
+        base_dir = Path(env.get("RADCOPILOT_BASE_DIR", default_base_dir)).resolve()
+        ui_dir = Path(env.get("RADCOPILOT_UI_DIR", base_dir / "radcopilot" / "ui")).resolve()
         log_file = Path(env.get("RADCOPILOT_LOG_FILE", base_dir / "radcopilot_errors.jsonl")).resolve()
         data_dir = Path(env.get("RADCOPILOT_DATA_DIR", base_dir / "radcopilot_datasets")).resolve()
+
         return cls(
+            app_name=env.get("RADCOPILOT_APP_NAME", APP_NAME),
             host=env.get("RADCOPILOT_HOST", DEFAULT_HOST),
             port=int(env.get("RADCOPILOT_PORT", DEFAULT_PORT)),
             ollama_url=env.get("RADCOPILOT_OLLAMA_URL", DEFAULT_OLLAMA_URL).rstrip("/"),
@@ -91,7 +102,7 @@ def _env_bool(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None:
         return default
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return raw.strip().lower() in {"1", "true", "yes", "on", "y"}
 
 
 def log_event(config: AppConfig, event_type: str, detail: object, *, context: str = "") -> None:
@@ -114,6 +125,7 @@ def show_error_and_exit(config: AppConfig, message: str) -> "None":
     """Crash-safe startup message. Shows a Windows dialog when possible."""
     log_event(config, "STARTUP_CRASH", message)
     print(f"\nFATAL ERROR: {message}", file=sys.stderr)
+
     try:
         if sys.platform == "win32":
             import ctypes  # pylint: disable=import-outside-toplevel
@@ -128,6 +140,7 @@ def show_error_and_exit(config: AppConfig, message: str) -> "None":
             print("Check the log file for details:", config.log_file, file=sys.stderr)
     except Exception:
         pass
+
     raise SystemExit(1)
 
 
@@ -155,36 +168,36 @@ def start_ollama(config: AppConfig) -> bool:
     env["OLLAMA_ORIGINS"] = "*"
 
     try:
-        kwargs = {"env": env}
+        kwargs: dict[str, object] = {"env": env}
         if sys.platform == "win32":
             kwargs["creationflags"] = subprocess.CREATE_NEW_CONSOLE  # type: ignore[attr-defined]
-        subprocess.Popen(["ollama", "serve"], **kwargs)  # noqa: S603,S607 - local developer tool
+
+        subprocess.Popen(["ollama", "serve"], **kwargs)  # noqa: S603,S607
         time.sleep(3)
+
         ok = ollama_available(config, timeout=3.0)
         if ok:
             log_event(config, "OLLAMA_START", "Started local Ollama server")
         else:
             log_event(config, "OLLAMA_WARN", "Ollama process launched but endpoint not yet responding")
         return ok
+
     except FileNotFoundError:
         msg = "ollama command not found. Install Ollama or disable auto-start."
         print(f"  WARNING: {msg}")
         log_event(config, "OLLAMA_MISSING", msg)
         return False
-    except Exception as exc:  # pragma: no cover - defensive startup path
+    except Exception as exc:  # pragma: no cover
         log_event(config, "OLLAMA_START_ERR", f"{type(exc).__name__}: {exc}")
         return False
 
 
 def bootstrap_startup_rag(config: AppConfig) -> None:
     """
-    Best-effort hook for the future modular RAG bootstrap.
+    Best-effort hook for modular RAG bootstrap.
 
-    Expected future import target:
+    Expected import target:
         radcopilot.rag.startup_index.build_startup_index(config)
-
-    This is optional by design so the launcher can run before the rest of the
-    refactor exists.
     """
     if not config.build_startup_rag:
         print("  Startup RAG bootstrap disabled.")
@@ -194,8 +207,8 @@ def bootstrap_startup_rag(config: AppConfig) -> None:
         from radcopilot.rag.startup_index import build_startup_index  # type: ignore
 
         print("  Building startup RAG index...")
-        build_startup_index(config)
-        log_event(config, "RAG_BOOTSTRAP", "Startup RAG index built")
+        result = build_startup_rag_result_safe(build_startup_index, config)
+        log_event(config, "RAG_BOOTSTRAP", result)
     except ModuleNotFoundError:
         print("  RAG bootstrap module not created yet — skipping.")
     except Exception as exc:
@@ -203,10 +216,22 @@ def bootstrap_startup_rag(config: AppConfig) -> None:
         log_event(config, "RAG_BOOTSTRAP_ERR", f"{type(exc).__name__}: {exc}")
 
 
+def build_startup_rag_result_safe(builder: object, config: AppConfig) -> object:
+    """
+    Call the startup-index builder and always return something loggable.
+    """
+    try:
+        result = builder(config)  # type: ignore[misc]
+        return result if result is not None else "Startup RAG index built"
+    except Exception:
+        raise
+
+
 def open_browser_delayed(config: AppConfig) -> None:
     """Open the local UI after a short delay."""
     if not config.open_browser:
         return
+
     time.sleep(config.browser_delay_seconds)
     try:
         webbrowser.open(config.base_url)
@@ -215,53 +240,85 @@ def open_browser_delayed(config: AppConfig) -> None:
 
 
 def default_index_html(config: AppConfig) -> str:
-    """Fallback UI shown before the full front-end is moved into /ui."""
+    """Fallback UI shown before the full front-end is available."""
     return f"""<!DOCTYPE html>
-<html lang=\"en\">
+<html lang="en">
 <head>
-  <meta charset=\"utf-8\">
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{config.app_name}</title>
   <style>
     body {{
-      margin: 0; font-family: Inter, Arial, sans-serif; background: #0b1220; color: #e5eef8;
-      display: grid; place-items: center; min-height: 100vh;
+      margin: 0;
+      font-family: Inter, Arial, sans-serif;
+      background: #0b1220;
+      color: #e5eef8;
+      display: grid;
+      place-items: center;
+      min-height: 100vh;
     }}
     .card {{
-      width: min(820px, 92vw); background: #101a2b; border: 1px solid #1f3150;
-      border-radius: 18px; padding: 28px; box-shadow: 0 20px 60px rgba(0,0,0,.35);
+      width: min(860px, 92vw);
+      background: #101a2b;
+      border: 1px solid #1f3150;
+      border-radius: 18px;
+      padding: 28px;
+      box-shadow: 0 20px 60px rgba(0,0,0,.35);
     }}
-    h1 {{ margin-top: 0; font-size: 1.8rem; }}
-    code {{ background: #0b1220; padding: 2px 6px; border-radius: 6px; }}
-    .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 18px; }}
-    .tile {{ background: #0d1728; border: 1px solid #1f3150; border-radius: 12px; padding: 14px; }}
-    a {{ color: #7dd3fc; }}
-    .muted {{ color: #9fb0c9; }}
+    h1 {{
+      margin-top: 0;
+      font-size: 1.8rem;
+    }}
+    code {{
+      background: #0b1220;
+      padding: 2px 6px;
+      border-radius: 6px;
+    }}
+    .grid {{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      margin-top: 18px;
+    }}
+    .tile {{
+      background: #0d1728;
+      border: 1px solid #1f3150;
+      border-radius: 12px;
+      padding: 14px;
+    }}
+    a {{
+      color: #7dd3fc;
+    }}
+    .muted {{
+      color: #9fb0c9;
+    }}
   </style>
 </head>
 <body>
-  <main class=\"card\">
+  <main class="card">
     <h1>{config.app_name}</h1>
-    <p>This modular launcher is running. The full browser UI has not been moved into <code>ui/index.html</code> yet, so you are seeing the fallback startup page.</p>
-    <div class=\"grid\">
-      <section class=\"tile\">
+    <p>The modular launcher is running. If the full browser UI is not ready yet, this fallback page is shown instead.</p>
+    <div class="grid">
+      <section class="tile">
         <strong>Server</strong>
-        <p class=\"muted\">Bound to <code>{config.base_url}</code></p>
+        <p class="muted">Bound to <code>{config.base_url}</code></p>
       </section>
-      <section class=\"tile\">
+      <section class="tile">
         <strong>Ollama</strong>
-        <p class=\"muted\">Configured at <code>{config.ollama_url}</code></p>
+        <p class="muted">Configured at <code>{config.ollama_url}</code></p>
       </section>
-      <section class=\"tile\">
+      <section class="tile">
+        <strong>UI Directory</strong>
+        <p class="muted"><code>{config.ui_dir}</code></p>
+      </section>
+      <section class="tile">
         <strong>Log File</strong>
-        <p class=\"muted\"><code>{config.log_file.name}</code></p>
-      </section>
-      <section class=\"tile\">
-        <strong>Next Step</strong>
-        <p class=\"muted\">Create <code>radcopilot/server/app.py</code> and <code>ui/index.html</code>.</p>
+        <p class="muted"><code>{config.log_file.name}</code></p>
       </section>
     </div>
-    <p style=\"margin-top: 18px;\"><a href=\"/health\">Health endpoint</a></p>
+    <p style="margin-top: 18px;">
+      <a href="/health">Health endpoint</a>
+    </p>
   </main>
 </body>
 </html>
@@ -299,10 +356,10 @@ def create_fallback_handler(config: AppConfig) -> Type[http.server.BaseHTTPReque
             self.end_headers()
             self.wfile.write(body)
 
-        def log_message(self, fmt: str, *args: object) -> None:  # noqa: A003 - stdlib signature
+        def log_message(self, fmt: str, *args: object) -> None:  # noqa: A003
             log_event(config, "HTTP", fmt % args, context=self.path)
 
-        def do_GET(self) -> None:  # noqa: N802 - stdlib handler name
+        def do_GET(self) -> None:  # noqa: N802
             if self.path in {"/", "/index.html"}:
                 html = _read_text_if_exists(config.ui_dir / "index.html") or default_index_html(config)
                 self._html(html)
@@ -317,6 +374,8 @@ def create_fallback_handler(config: AppConfig) -> Type[http.server.BaseHTTPReque
                         "ollama_url": config.ollama_url,
                         "ollama_up": ollama_available(config),
                         "ui_dir": str(config.ui_dir),
+                        "data_dir": str(config.data_dir),
+                        "log_file": str(config.log_file),
                     }
                 )
                 return
@@ -324,8 +383,10 @@ def create_fallback_handler(config: AppConfig) -> Type[http.server.BaseHTTPReque
             if self.path == "/config":
                 self._json(
                     {
+                        "app_name": config.app_name,
                         "host": config.host,
                         "port": config.port,
+                        "base_url": config.base_url,
                         "ollama_url": config.ollama_url,
                         "open_browser": config.open_browser,
                         "data_dir": str(config.data_dir),
@@ -336,7 +397,7 @@ def create_fallback_handler(config: AppConfig) -> Type[http.server.BaseHTTPReque
 
             self._json({"ok": False, "error": "Not Found", "path": self.path}, status=404)
 
-        def do_POST(self) -> None:  # noqa: N802 - stdlib handler name
+        def do_POST(self) -> None:  # noqa: N802
             self._json(
                 {
                     "ok": False,
@@ -351,9 +412,9 @@ def create_fallback_handler(config: AppConfig) -> Type[http.server.BaseHTTPReque
 
 def resolve_handler(config: AppConfig) -> Type[http.server.BaseHTTPRequestHandler]:
     """
-    Prefer the future modular server app if it exists.
+    Prefer the modular server app if it exists.
 
-    Expected future shapes:
+    Expected shapes:
       - radcopilot.server.app.create_handler(config) -> HandlerClass
       - radcopilot.server.app.Handler
     """
@@ -415,21 +476,33 @@ def run() -> int:
             threading.Thread(target=open_browser_delayed, args=(config,), daemon=True).start()
 
         with ThreadingHTTPServer((config.host, config.port), handler) as httpd:
-            log_event(config, "SERVER_START", {"base_url": config.base_url, "ollama_url": config.ollama_url})
+            log_event(
+                config,
+                "SERVER_START",
+                {
+                    "base_url": config.base_url,
+                    "ollama_url": config.ollama_url,
+                    "ui_dir": str(config.ui_dir),
+                    "data_dir": str(config.data_dir),
+                },
+            )
             httpd.serve_forever()
 
     except KeyboardInterrupt:
         print(f"\n  {config.app_name} stopped.")
         log_event(config, "SERVER_STOP", "Stopped by user")
         return 0
+
     except OSError as exc:
         msg = f"Port {config.port} is unavailable: {exc}"
         log_event(config, "PORT_IN_USE", msg)
         show_error_and_exit(config, msg)
-    except Exception as exc:  # pragma: no cover - final startup safety net
+
+    except Exception as exc:  # pragma: no cover
         tb = traceback.format_exc()
         log_event(config, "UNHANDLED_STARTUP_ERR", f"{type(exc).__name__}: {exc}\n{tb}")
         show_error_and_exit(config, f"{type(exc).__name__}: {exc}")
+
     return 0
 
 
