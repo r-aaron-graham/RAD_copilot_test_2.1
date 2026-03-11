@@ -451,7 +451,10 @@ def read_history_items(
     history_file: str | Path | None = None,
 ) -> list[HistoryEntry]:
     """Low-level typed reader."""
-    return [HistoryEntry(**_strip_search_fields(item)) for item in _read_history_dicts(config=config, history_file=history_file)]
+    return [
+        HistoryEntry(**_strip_search_fields(item))
+        for item in _read_history_dicts(config=config, history_file=history_file)
+    ]
 
 
 def write_history_items(
@@ -461,7 +464,7 @@ def write_history_items(
     history_file: str | Path | None = None,
 ) -> dict[str, Any]:
     """Low-level typed writer."""
-    normalized = []
+    normalized: list[dict[str, Any]] = []
     for item in items:
         if isinstance(item, HistoryEntry):
             normalized.append(normalize_history_entry(asdict(item)))
@@ -908,7 +911,6 @@ def _normalize_timestamp(value: Any) -> str:
     text = str(value).strip()
     if not text:
         return ""
-    # Accept already-usable ISO-like strings as-is.
     return text
 
 
@@ -941,7 +943,6 @@ def _quarantine_corrupt_history_file(path: Path) -> None:
         backup = path.with_name(f"{path.stem}.corrupt_{stamp}{path.suffix}")
         shutil.move(str(path), str(backup))
     except Exception:
-        # Best effort only. Avoid raising from recovery.
         return
 
 
