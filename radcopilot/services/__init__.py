@@ -45,8 +45,8 @@ def _safe_import(module_name: str) -> ModuleType | None:
 
 def _register_module(module_name: str, alias: str | None = None) -> ModuleType | None:
     """
-    Import a service module, export the module object, and re-export its __all__
-    symbols if present.
+    Import a service module, export the module object, and re-export its
+    __all__ symbols if present.
     """
     module = _safe_import(module_name)
     public_name = alias or module_name
