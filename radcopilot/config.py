@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 Shared configuration for the modular RadCopilot refactor.
 
@@ -11,8 +13,6 @@ This file is intended to live at:
 
 That means the real project root is one directory above this file.
 """
-
-from __future__ import annotations
 
 import os
 from dataclasses import asdict, dataclass, field
@@ -410,7 +410,32 @@ def load_config(project_root: Optional[Path] = None) -> AppConfig:
     return config
 
 
-DEFAULT_CONFIG = load_config()
+_default_config_cache: Optional[AppConfig] = None
+
+
+def get_default_config(project_root: Optional[Path] = None) -> AppConfig:
+    """
+    Lazily load and cache the default configuration.
+
+    This avoids import-time side effects such as directory creation when the
+    module is merely imported for metadata or type access.
+    """
+    global _default_config_cache
+
+    requested_root = (project_root or _project_root()).resolve()
+    if _default_config_cache is None or _default_config_cache.paths.project_root != requested_root:
+        _default_config_cache = load_config(requested_root)
+    return _default_config_cache
+
+
+def __getattr__(name: str) -> Any:
+    """
+    Provide a lazy DEFAULT_CONFIG compatibility export without performing
+    load_config() at import time.
+    """
+    if name == "DEFAULT_CONFIG":
+        return get_default_config()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 __all__ = [
@@ -430,5 +455,6 @@ __all__ = [
     "UISettings",
     "WhisperSettings",
     "build_paths",
+    "get_default_config",
     "load_config",
 ]
