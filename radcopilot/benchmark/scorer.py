@@ -55,10 +55,9 @@ structural alignment and local consistency.
 from collections import Counter
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-import math
 import re
 from statistics import mean
-from typing import Any, Callable, Iterable, Iterator, Mapping, MutableMapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
 # Optional validator integration.
 try:  # pragma: no cover - import path depends on package execution mode
@@ -77,11 +76,55 @@ MAX_CASES_PER_RUN = 50_000
 
 # Conservative stopwords to reduce noise in content-token metrics.
 _STOPWORDS = {
-    "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "has", "have",
-    "in", "is", "it", "its", "of", "on", "or", "that", "the", "their", "there",
-    "this", "to", "was", "were", "with", "within", "without", "into", "than",
-    "then", "these", "those", "which", "also", "may", "can", "could", "would",
-    "should", "noted", "not", "no", "none", "mild", "moderate", "severe",
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "has",
+    "have",
+    "in",
+    "is",
+    "it",
+    "its",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "their",
+    "there",
+    "this",
+    "to",
+    "was",
+    "were",
+    "with",
+    "within",
+    "without",
+    "into",
+    "than",
+    "then",
+    "these",
+    "those",
+    "which",
+    "also",
+    "may",
+    "can",
+    "could",
+    "would",
+    "should",
+    "noted",
+    "not",
+    "no",
+    "none",
+    "mild",
+    "moderate",
+    "severe",
 }
 
 _NEGATION_PATTERNS = (
@@ -297,7 +340,9 @@ def score_case(
         ),
     )
     predicted = _clean_text(
-        prediction if prediction is not None else _first_text(
+        prediction
+        if prediction is not None
+        else _first_text(
             case,
             (
                 "predicted_text",
@@ -383,7 +428,12 @@ def score_cases(
     results: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
 
-    if strict_count and predictions is not None and isinstance(predictions, Sequence) and not isinstance(predictions, (str, bytes, bytearray)):
+    if (
+        strict_count
+        and predictions is not None
+        and isinstance(predictions, Sequence)
+        and not isinstance(predictions, (str, bytes, bytearray))
+    ):
         if len(predictions) != len(safe_cases):
             return {
                 "ok": False,
@@ -403,7 +453,15 @@ def score_cases(
         if isinstance(resolved_prediction, Mapping):
             candidate_text = _first_text(
                 resolved_prediction,
-                ("predicted_text", "prediction", "generated_impression", "generated_text", "output", "result", "response"),
+                (
+                    "predicted_text",
+                    "prediction",
+                    "generated_impression",
+                    "generated_text",
+                    "output",
+                    "result",
+                    "response",
+                ),
             )
         else:
             candidate_text = _clean_text(resolved_prediction, MAX_TEXT_CHARS)
@@ -531,8 +589,6 @@ def _score_components(
     validator_error_count = int(validator_payload.get("error_count", 0))
     validator_warning_count = int(validator_payload.get("warning_count", 0))
 
-    # Weighted composite tuned for local benchmarking:
-    # lexical/core overlap matters most, but structural correctness matters too.
     composite = (
         0.22 * token_f1
         + 0.16 * content_f1
@@ -547,7 +603,6 @@ def _score_components(
     if exact_match >= 1.0:
         composite = min(1.0, composite + 0.05)
 
-    # Penalize validator hard errors.
     if validator_error_count > 0:
         composite = max(0.0, composite - min(0.25, 0.08 * validator_error_count))
     elif validator_warning_count > 0:
@@ -698,7 +753,6 @@ def _rouge_l_f1(pred_tokens: Sequence[str], ref_tokens: Sequence[str]) -> float:
 def _lcs_length(a: Sequence[str], b: Sequence[str]) -> int:
     if not a or not b:
         return 0
-    # Memory-efficient dynamic programming.
     prev = [0] * (len(b) + 1)
     for token_a in a:
         curr = [0]
@@ -778,7 +832,6 @@ def _number_consistency(predicted_text: str, reference_text: str) -> float:
     overlap = sum(min(ref_counts[k], pred_counts[k]) for k in ref_counts.keys())
     recall = overlap / max(1, sum(ref_counts.values()))
 
-    # Also reward approximate numeric closeness when exact unit tuples differ.
     if recall >= 1.0:
         return 1.0
 
@@ -831,7 +884,6 @@ def _length_similarity(predicted_text: str, reference_text: str) -> float:
     pred_len = max(1, len(tokenize(predicted_text)))
     ref_len = max(1, len(tokenize(reference_text)))
     ratio = min(pred_len, ref_len) / max(pred_len, ref_len)
-    # Gentle penalty for massive length mismatch.
     return max(0.0, min(1.0, ratio))
 
 
@@ -879,7 +931,6 @@ def _run_validator(
             ],
         }
 
-    # Compatible with either a dataclass result or plain dict.
     if hasattr(result, "to_dict"):
         payload = result.to_dict()
     elif isinstance(result, Mapping):
