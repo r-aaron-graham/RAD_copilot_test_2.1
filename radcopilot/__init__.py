@@ -12,8 +12,6 @@ It supports both direct package imports and tooling that expects a small,
 stable package surface.
 """
 
-from typing import Any
-
 __title__ = "radcopilot"
 __description__ = "Local-first radiology AI workstation"
 __url__ = "https://github.com/r-aaron-graham/RAD_copilot_test_2.1"
@@ -49,12 +47,11 @@ except Exception:  # pragma: no cover
     AppConfig = None  # type: ignore[assignment]
 
 
-# The current repo surface should expose runtime entrypoints from main.py.
-# Do not import nonexistent symbols such as create_app.
+# main.py exposes run() as the public runtime entrypoint.
+# Do not import a nonexistent main() symbol.
 try:
-    from .main import main, run
+    from .main import run
 except Exception:  # pragma: no cover
-    main = None  # type: ignore[assignment]
     run = None  # type: ignore[assignment]
 
 
@@ -69,5 +66,4 @@ __all__ = [
     "get_package_info",
     "AppConfig",
     "run",
-    "main",
 ]
