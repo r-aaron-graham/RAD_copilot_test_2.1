@@ -5,7 +5,8 @@ radcopilot.services.whisper_service
 
 Optional local Whisper speech-to-text service for RadCopilot Local.
 
-Goals:
+Goals
+-----
 - keep Whisper integration isolated from the HTTP server layer
 - lazy-load the Whisper model only when needed
 - support raw body, JSON-base64, and multipart uploads
@@ -14,16 +15,21 @@ Goals:
 
 This module intentionally uses only the Python standard library plus the
 optional `whisper` dependency when it is available.
+
+Python 3.13 note
+----------------
+The legacy `cgi` module was removed in Python 3.13. This implementation avoids
+`cgi.FieldStorage` entirely and parses multipart/form-data using the standard
+library `email` package instead.
 """
 
 from dataclasses import dataclass, field
 import base64
-import cgi
 from datetime import datetime, timezone
+from email.parser import BytesParser
+from email.policy import default as email_policy_default
 import hashlib
-import io
 import json
-import os
 from pathlib import Path
 import tempfile
 import threading
@@ -206,6 +212,7 @@ def transcribe_file(
     text = normalize_text(str(result.get("text") or ""))
     segments = normalize_segments(result.get("segments"))
     language_out = str(result.get("language") or language or "")
+    duration_seconds = infer_duration_seconds(segments)
 
     return TranscriptionResult(
         ok=True,
@@ -213,6 +220,7 @@ def transcribe_file(
         model_name=model_name,
         task=kwargs["task"],
         language=language_out,
+        duration_seconds=duration_seconds,
         source_bytes=int(path.stat().st_size),
         source_name=path.name,
         source_sha256=sha256_file(path),
@@ -239,6 +247,7 @@ def transcribe_bytes(
             task=task,
             error="Empty audio payload",
         ).to_dict()
+
     if len(audio_bytes) > MAX_UPLOAD_BYTES:
         return TranscriptionResult(
             ok=False,
@@ -286,13 +295,16 @@ def transcribe_request(config: ConfigLike, handler: Any) -> dict[str, Any]:
     """
     try:
         content_type = str(handler.headers.get("Content-Type") or "").strip()
+        content_type_lower = content_type.lower()
         length = int(handler.headers.get("Content-Length", "0") or "0")
+
         if length <= 0:
             return TranscriptionResult(
                 ok=False,
                 available=whisper_available(),
                 error="Missing or empty request body",
             ).to_dict()
+
         if length > MAX_UPLOAD_BYTES:
             return TranscriptionResult(
                 ok=False,
@@ -309,7 +321,7 @@ def transcribe_request(config: ConfigLike, handler: Any) -> dict[str, Any]:
         filename = str(handler.headers.get("X-Filename") or "audio.webm").strip() or "audio.webm"
         temperature = 0.0
 
-        if content_type.startswith("multipart/form-data"):
+        if content_type_lower.startswith("multipart/form-data"):
             parsed = parse_multipart(handler=handler, content_type=content_type, content_length=length)
             if not parsed["ok"]:
                 return parsed
@@ -321,7 +333,7 @@ def transcribe_request(config: ConfigLike, handler: Any) -> dict[str, Any]:
             temperature = float(parsed.get("temperature") or 0.0)
         else:
             raw = handler.rfile.read(length)
-            if content_type.startswith("application/json"):
+            if content_type_lower.startswith("application/json"):
                 parsed = parse_json_audio_request(raw)
                 if not parsed["ok"]:
                     return parsed
@@ -393,7 +405,11 @@ def parse_json_audio_request(raw: bytes) -> dict[str, Any]:
     try:
         payload = json.loads(raw.decode("utf-8"))
     except Exception as exc:
-        return {"ok": False, "error": f"Invalid JSON body: {type(exc).__name__}: {exc}", "available": whisper_available()}
+        return {
+            "ok": False,
+            "error": f"Invalid JSON body: {type(exc).__name__}: {exc}",
+            "available": whisper_available(),
+        }
 
     if not isinstance(payload, dict):
         return {"ok": False, "error": "JSON body must be an object", "available": whisper_available()}
@@ -410,7 +426,11 @@ def parse_json_audio_request(raw: bytes) -> dict[str, Any]:
     try:
         audio_bytes = decode_base64_audio(str(audio_b64))
     except Exception as exc:
-        return {"ok": False, "error": f"Invalid base64 audio payload: {type(exc).__name__}: {exc}", "available": whisper_available()}
+        return {
+            "ok": False,
+            "error": f"Invalid base64 audio payload: {type(exc).__name__}: {exc}",
+            "available": whisper_available(),
+        }
 
     return {
         "ok": True,
@@ -424,53 +444,95 @@ def parse_json_audio_request(raw: bytes) -> dict[str, Any]:
 
 
 def parse_multipart(*, handler: Any, content_type: str, content_length: int) -> dict[str, Any]:
-    """Parse a multipart upload and extract the most likely audio file field."""
-    environ = {
-        "REQUEST_METHOD": "POST",
-        "CONTENT_TYPE": content_type,
-        "CONTENT_LENGTH": str(content_length),
-    }
-    headers = {"content-type": content_type}
-    fs = cgi.FieldStorage(  # noqa: UP031 - stdlib multipart parser remains pragmatic here
-        fp=handler.rfile,
-        headers=headers,
-        environ=environ,
-        keep_blank_values=True,
-    )
+    """
+    Parse a multipart upload and extract the most likely audio file field.
 
-    file_field = None
-    for candidate in _AUDIO_FIELD_CANDIDATES:
-        if candidate in fs:
-            file_field = fs[candidate]
-            break
-    if file_field is None:
-        for key in fs.keys():
-            field = fs[key]
-            if getattr(field, "file", None) is not None:
-                file_field = field
-                break
-    if file_field is None or getattr(file_field, "file", None) is None:
-        return {"ok": False, "error": "Multipart request did not contain an audio file field", "available": whisper_available()}
+    This avoids the removed `cgi` module by using the standard-library `email`
+    package to parse MIME multipart content.
+    """
+    raw = handler.rfile.read(content_length)
+    if not raw:
+        return {"ok": False, "error": "Multipart body was empty", "available": whisper_available()}
 
-    file_obj = file_field.file
-    audio_bytes = read_binary_stream(file_obj)
-    filename = str(getattr(file_field, "filename", "") or "audio.webm")
+    try:
+        message = _parse_multipart_message(raw, content_type)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"Could not parse multipart request: {type(exc).__name__}: {exc}",
+            "available": whisper_available(),
+        }
 
-    def _field_text(name: str, default: str = "") -> str:
-        if name not in fs:
-            return default
-        value = fs.getvalue(name)
-        return str(value).strip() if value is not None else default
+    if not message.is_multipart():
+        return {
+            "ok": False,
+            "error": "Request body is not a valid multipart payload",
+            "available": whisper_available(),
+        }
+
+    file_candidate: dict[str, Any] | None = None
+    text_fields: dict[str, str] = {}
+
+    for part in message.iter_parts():
+        disposition = str(part.get_content_disposition() or "").lower()
+        if disposition not in {"form-data", "attachment", "inline", ""}:
+            continue
+
+        name = str(part.get_param("name", header="content-disposition") or "").strip()
+        filename = str(part.get_filename() or "").strip()
+        payload_bytes = part.get_payload(decode=True) or b""
+
+        if filename or name in _AUDIO_FIELD_CANDIDATES:
+            candidate = {
+                "name": name,
+                "filename": filename or "audio.webm",
+                "payload": payload_bytes,
+            }
+
+            if file_candidate is None:
+                file_candidate = candidate
+            elif name in _AUDIO_FIELD_CANDIDATES and file_candidate.get("name") not in _AUDIO_FIELD_CANDIDATES:
+                file_candidate = candidate
+            elif filename and not file_candidate.get("filename"):
+                file_candidate = candidate
+            continue
+
+        charset = part.get_content_charset() or "utf-8"
+        try:
+            text_value = payload_bytes.decode(charset, errors="replace").strip()
+        except Exception:
+            text_value = payload_bytes.decode("utf-8", errors="replace").strip()
+        if name:
+            text_fields[name] = text_value
+
+    if file_candidate is None or not file_candidate.get("payload"):
+        return {
+            "ok": False,
+            "error": "Multipart request did not contain an audio file field",
+            "available": whisper_available(),
+        }
 
     return {
         "ok": True,
-        "audio_bytes": audio_bytes,
-        "filename": filename,
-        "model_name": _field_text("model_name", _field_text("model", DEFAULT_MODEL_NAME)),
-        "task": _field_text("task", DEFAULT_TASK),
-        "language": _field_text("language", ""),
-        "temperature": _coerce_float(_field_text("temperature", "0"), 0.0),
+        "audio_bytes": bytes(file_candidate["payload"]),
+        "filename": str(file_candidate.get("filename") or "audio.webm"),
+        "model_name": first_non_empty(text_fields.get("model_name"), text_fields.get("model"), DEFAULT_MODEL_NAME),
+        "task": first_non_empty(text_fields.get("task"), DEFAULT_TASK),
+        "language": first_non_empty(text_fields.get("language"), ""),
+        "temperature": _coerce_float(first_non_empty(text_fields.get("temperature"), "0"), 0.0),
     }
+
+
+def _parse_multipart_message(raw: bytes, content_type: str):
+    """
+    Build a synthetic MIME message and parse it with the standard library email parser.
+    """
+    header_block = (
+        f"MIME-Version: 1.0\r\n"
+        f"Content-Type: {content_type}\r\n"
+        f"\r\n"
+    ).encode("utf-8")
+    return BytesParser(policy=email_policy_default).parsebytes(header_block + raw)
 
 
 def normalize_segments(raw_segments: Any) -> list[dict[str, Any]]:
@@ -490,6 +552,22 @@ def normalize_segments(raw_segments: Any) -> list[dict[str, Any]]:
                 seg[key] = item[key]
         segments.append(seg)
     return segments
+
+
+def infer_duration_seconds(segments: list[dict[str, Any]]) -> float | None:
+    """Infer a rough duration from the normalized Whisper segment list."""
+    if not segments:
+        return None
+    ends: list[float] = []
+    for seg in segments:
+        try:
+            if "end" in seg:
+                ends.append(float(seg["end"]))
+        except Exception:
+            continue
+    if not ends:
+        return None
+    return max(ends)
 
 
 def normalize_text(text: str) -> str:
@@ -568,3 +646,31 @@ def _coerce_float(value: Any, default: float) -> float:
         return float(value)
     except Exception:
         return default
+
+
+__all__ = [
+    "DEFAULT_MODEL_NAME",
+    "DEFAULT_TASK",
+    "MAX_UPLOAD_BYTES",
+    "TranscriptionResult",
+    "WhisperStatus",
+    "decode_base64_audio",
+    "first_non_empty",
+    "get_status",
+    "infer_duration_seconds",
+    "load_model",
+    "normalize_segments",
+    "normalize_text",
+    "parse_json_audio_request",
+    "parse_multipart",
+    "read_binary_stream",
+    "safe_suffix",
+    "sha256_bytes",
+    "sha256_file",
+    "transcribe_bytes",
+    "transcribe_file",
+    "transcribe_request",
+    "unload_model",
+    "utc_now",
+    "whisper_available",
+]
