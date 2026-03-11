@@ -109,7 +109,7 @@ def asset_exists(name: str) -> bool:
     """Return True if a named UI asset exists."""
     try:
         return get_asset_path(name, must_exist=True).is_file()
-    except FileNotFoundError:
+    except (FileNotFoundError, ValueError):
         return False
 
 
@@ -146,6 +146,8 @@ def get_content_type(name_or_path: str | Path) -> str:
     content_type, _ = mimetypes.guess_type(value)
 
     if content_type:
+        if content_type.startswith("text/"):
+            return f"{content_type}; charset=utf-8"
         return content_type
 
     suffix = Path(value).suffix.lower()
