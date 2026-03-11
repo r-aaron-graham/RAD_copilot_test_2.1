@@ -39,21 +39,23 @@ def get_package_info() -> dict[str, str]:
     }
 
 
+# Keep imports narrow and import-safe.
+# The current repo surface does not reliably expose UIConfig / ServerConfig /
+# ModelConfig / DataConfig from config.py, so do not import symbols that may
+# not exist.
 try:
-    from .config import AppConfig, UIConfig, ServerConfig, ModelConfig, DataConfig
+    from .config import AppConfig
 except Exception:  # pragma: no cover
     AppConfig = None  # type: ignore[assignment]
-    UIConfig = None  # type: ignore[assignment]
-    ServerConfig = None  # type: ignore[assignment]
-    ModelConfig = None  # type: ignore[assignment]
-    DataConfig = None  # type: ignore[assignment]
 
 
+# The current repo surface should expose runtime entrypoints from main.py.
+# Do not import nonexistent symbols such as create_app.
 try:
-    from .main import create_app, main
+    from .main import main, run
 except Exception:  # pragma: no cover
-    create_app = None  # type: ignore[assignment]
     main = None  # type: ignore[assignment]
+    run = None  # type: ignore[assignment]
 
 
 __all__ = [
@@ -66,10 +68,6 @@ __all__ = [
     "get_version",
     "get_package_info",
     "AppConfig",
-    "UIConfig",
-    "ServerConfig",
-    "ModelConfig",
-    "DataConfig",
-    "create_app",
+    "run",
     "main",
 ]
