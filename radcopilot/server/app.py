@@ -15,6 +15,8 @@ Current goals:
 - expose health/config/log routes
 - expose RAG utility routes
 - expose working benchmark dataset loading and scoring routes
+- expose working report routes
+- expose working history routes
 - proxy `/api/*` requests to local Ollama
 - keep optional feature routes available even before every service module exists
 - fail gracefully with explicit JSON errors instead of crashing
@@ -63,7 +65,7 @@ def create_handler(config: ConfigLike) -> Type[BaseHTTPRequestHandler]:
     """
 
     class Handler(BaseHTTPRequestHandler):
-        server_version = "RadCopilotLocal/0.3"
+        server_version = "RadCopilotLocal/0.4"
 
         # -----------------------------
         # Generic helpers
@@ -187,6 +189,33 @@ def create_handler(config: ConfigLike) -> Type[BaseHTTPRequestHandler]:
                     self._json(_benchmark_load_path(config, source_path, limit=limit))
                     return
 
+                if path == "/report/templates":
+                    self._json(_report_templates())
+                    return
+
+                if path.startswith("/report/templates/"):
+                    template_id = path.removeprefix("/report/templates/").strip("/")
+                    self._json(_report_template_detail(template_id))
+                    return
+
+                if path == "/history":
+                    limit = max(1, min(500, _safe_int(self._query_first("limit", "50"), 50)))
+                    offset = max(0, _safe_int(self._query_first("offset", "0"), 0))
+                    query = self._query_first("q", "").strip()
+                    self._json(_history_list(config, limit=limit, offset=offset, query=query))
+                    return
+
+                if path.startswith("/history/") and not path.startswith("/history/search"):
+                    entry_id = path.removeprefix("/history/").strip("/")
+                    self._json(_history_get(config, entry_id))
+                    return
+
+                if path == "/history/search":
+                    query = self._query_first("q", "").strip()
+                    limit = max(1, min(500, _safe_int(self._query_first("limit", "20"), 20)))
+                    self._json(_history_list(config, limit=limit, query=query))
+                    return
+
                 if path.startswith("/api/"):
                     self._proxy_to_ollama("GET")
                     return
@@ -237,6 +266,31 @@ def create_handler(config: ConfigLike) -> Type[BaseHTTPRequestHandler]:
                     self._json(_whisper_transcribe(config, self))
                     return
 
+                if path == "/report/generate":
+                    payload = self._read_json_body()
+                    self._json(_report_generate(config, payload))
+                    return
+
+                if path == "/report/guidelines":
+                    payload = self._read_json_body()
+                    self._json(_report_guidelines(config, payload))
+                    return
+
+                if path == "/report/validate":
+                    payload = self._read_json_body()
+                    self._json(_report_validate(config, payload))
+                    return
+
+                if path == "/history":
+                    payload = self._read_json_body()
+                    self._json(_history_append(config, payload))
+                    return
+
+                if path.startswith("/history/") and path.endswith("/star"):
+                    entry_id = path.removeprefix("/history/").removesuffix("/star").strip("/")
+                    self._json(_history_toggle_star(config, entry_id))
+                    return
+
                 if path.startswith("/api/"):
                     self._proxy_to_ollama("POST")
                     return
@@ -244,6 +298,20 @@ def create_handler(config: ConfigLike) -> Type[BaseHTTPRequestHandler]:
                 self._send_not_found()
             except json.JSONDecodeError:
                 self._json({"ok": False, "error": "Invalid JSON body", "path": self.path}, status=400)
+            except Exception as exc:  # pragma: no cover
+                self._handle_route_exception(exc)
+
+        def do_DELETE(self) -> None:  # noqa: N802 - stdlib handler name
+            try:
+                parsed = urllib.parse.urlparse(self.path)
+                path = parsed.path
+
+                if path.startswith("/history/"):
+                    entry_id = path.removeprefix("/history/").strip("/")
+                    self._json(_history_delete(config, entry_id))
+                    return
+
+                self._send_not_found()
             except Exception as exc:  # pragma: no cover
                 self._handle_route_exception(exc)
 
@@ -277,6 +345,8 @@ def create_handler(config: ConfigLike) -> Type[BaseHTTPRequestHandler]:
             self._bytes(target.read_bytes(), content_type=content_type)
 
         def _proxy_to_ollama(self, method: str) -> None:
+            # Note: proxy.py remains a richer streaming-capable implementation.
+            # This inline proxy is kept for minimal local-server compatibility.
             parsed = urllib.parse.urlparse(self.path)
             target_url = f"{config.ollama_url}{parsed.path}"
             if parsed.query:
@@ -696,6 +766,170 @@ def _benchmark_score(config: ConfigLike, payload: dict[str, Any]) -> dict[str, A
 
 
 # -----------------------------
+# Report route payload builders
+# -----------------------------
+
+
+def _report_templates() -> dict[str, Any]:
+    try:
+        from radcopilot.report.generator import list_templates  # type: ignore
+
+        return {"ok": True, "default_template_id": "ct-chest", "items": list_templates()}
+    except ModuleNotFoundError:
+        return {"ok": False, "error": "Report generator module not available"}
+    except Exception as exc:
+        return {"ok": False, "error": f"Failed to list templates: {type(exc).__name__}: {exc}"}
+
+
+def _report_template_detail(template_id: str) -> dict[str, Any]:
+    try:
+        from radcopilot.report.generator import get_template  # type: ignore
+
+        template = get_template(template_id or None)
+        return {
+            "ok": True,
+            "requested_template_id": template_id,
+            "item": {
+                "id": template.id,
+                "label": template.label,
+                "modality": template.modality,
+                "section_order": list(template.section_order),
+                "section_labels": dict(template.section_labels),
+                "section_defaults": dict(template.section_defaults),
+                "guideline_hint": template.guideline_hint,
+                "allow_negatives_in_impression": bool(template.allow_negatives_in_impression),
+            },
+        }
+    except ModuleNotFoundError:
+        return {"ok": False, "error": "Report generator module not available"}
+    except Exception as exc:
+        return {"ok": False, "error": f"Failed to get template: {type(exc).__name__}: {exc}"}
+
+
+def _report_generate(config: ConfigLike, payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        from radcopilot.report.generator import ReportRequest, generate_report  # type: ignore
+
+        request = ReportRequest.from_mapping(payload)
+        result = generate_report(request, config=config)
+        response: dict[str, Any] = result.to_dict()
+        response.setdefault("ok", result.ok)
+        return response
+    except ModuleNotFoundError:
+        return {"ok": False, "error": "Report generator module not available"}
+    except Exception as exc:
+        return {"ok": False, "error": f"Report generation failed: {type(exc).__name__}: {exc}"}
+
+
+def _report_guidelines(config: ConfigLike, payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        from radcopilot.report.guidelines import generate_guideline_text  # type: ignore
+
+        use_model = bool(payload.pop("use_model", True))
+        result = generate_guideline_text(config=config, context=payload, use_model=use_model)
+        return result.to_dict()
+    except ModuleNotFoundError:
+        return {"ok": False, "error": "Report guidelines module not available"}
+    except Exception as exc:
+        return {"ok": False, "error": f"Guideline generation failed: {type(exc).__name__}: {exc}"}
+
+
+def _report_validate(config: ConfigLike, payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        from radcopilot.report.validator import validate_impression, summarize_issues  # type: ignore
+
+        impression = str(payload.get("impression", "") or "")
+        findings = str(payload.get("findings", "") or "")
+        if not impression.strip():
+            return {"ok": False, "error": "Missing required field: impression"}
+        result = validate_impression(
+            impression,
+            findings_text=findings,
+            template_id=str(payload.get("template_id", "") or ""),
+            allow_negatives=bool(payload.get("allow_negatives", False)),
+        )
+        return {
+            "ok": True,
+            "valid": result.valid,
+            "summary": summarize_issues(result),
+            "validation": result.to_dict(),
+        }
+    except ModuleNotFoundError:
+        return {"ok": False, "error": "Report validator module not available"}
+    except Exception as exc:
+        return {"ok": False, "error": f"Report validation failed: {type(exc).__name__}: {exc}"}
+
+
+# -----------------------------
+# History route payload builders
+# -----------------------------
+
+
+def _history_list(
+    config: ConfigLike,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+    query: str = "",
+) -> dict[str, Any]:
+    try:
+        from radcopilot.services.history_service import list_history  # type: ignore
+
+        return list_history(config=config, limit=limit, offset=offset, query=query)
+    except ModuleNotFoundError:
+        return {"ok": False, "error": "History service not available"}
+    except Exception as exc:
+        return {"ok": False, "error": f"History list failed: {type(exc).__name__}: {exc}"}
+
+
+def _history_get(config: ConfigLike, entry_id: str) -> dict[str, Any]:
+    try:
+        from radcopilot.services.history_service import get_history_entry  # type: ignore
+
+        result = get_history_entry(entry_id=entry_id, config=config)
+        if result is None:
+            return {"ok": False, "error": f"History entry not found: {entry_id}"}
+        return {"ok": True, "item": result}
+    except ModuleNotFoundError:
+        return {"ok": False, "error": "History service not available"}
+    except Exception as exc:
+        return {"ok": False, "error": f"History get failed: {type(exc).__name__}: {exc}"}
+
+
+def _history_append(config: ConfigLike, payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        from radcopilot.services.history_service import append_history_entry  # type: ignore
+
+        return append_history_entry(payload, config=config)
+    except ModuleNotFoundError:
+        return {"ok": False, "error": "History service not available"}
+    except Exception as exc:
+        return {"ok": False, "error": f"History append failed: {type(exc).__name__}: {exc}"}
+
+
+def _history_delete(config: ConfigLike, entry_id: str) -> dict[str, Any]:
+    try:
+        from radcopilot.services.history_service import delete_history_entry  # type: ignore
+
+        return delete_history_entry(entry_id=entry_id, config=config)
+    except ModuleNotFoundError:
+        return {"ok": False, "error": "History service not available"}
+    except Exception as exc:
+        return {"ok": False, "error": f"History delete failed: {type(exc).__name__}: {exc}"}
+
+
+def _history_toggle_star(config: ConfigLike, entry_id: str) -> dict[str, Any]:
+    try:
+        from radcopilot.services.history_service import toggle_star  # type: ignore
+
+        return toggle_star(entry_id=entry_id, config=config)
+    except ModuleNotFoundError:
+        return {"ok": False, "error": "History service not available"}
+    except Exception as exc:
+        return {"ok": False, "error": f"History star toggle failed: {type(exc).__name__}: {exc}"}
+
+
+# -----------------------------
 # Benchmark helpers
 # -----------------------------
 
@@ -800,7 +1034,9 @@ def _fallback_index_html(config: ConfigLike) -> str:
       <a href="/health">/health</a> ·
       <a href="/config">/config</a> ·
       <a href="/rag/status">/rag/status</a> ·
-      <a href="/benchmark/datasets">/benchmark/datasets</a>
+      <a href="/benchmark/datasets">/benchmark/datasets</a> ·
+      <a href="/report/templates">/report/templates</a> ·
+      <a href="/history">/history</a>
     </p>
   </main>
 </body>
