@@ -11,11 +11,12 @@ immediately with the previously created `main.py` entrypoint.
 
 Current goals:
 - provide a production-quality local HTTP handler factory
-- serve the UI from /ui when available
+- serve the UI when available
 - expose health/config/log routes
-- expose the core route surface used by the original app
+- expose RAG utility routes
+- expose working benchmark dataset loading and scoring routes
 - proxy `/api/*` requests to local Ollama
-- keep optional feature routes available even before their service modules exist
+- keep optional feature routes available even before every service module exists
 - fail gracefully with explicit JSON errors instead of crashing
 
 This module intentionally uses only the Python standard library so it can run
@@ -120,17 +121,6 @@ def create_handler(config: ConfigLike) -> Type[BaseHTTPRequestHandler]:
         def _send_not_found(self) -> None:
             self._json({"ok": False, "error": "Not Found", "path": self.path}, status=404)
 
-        def _send_not_implemented(self, message: str) -> None:
-            self._json(
-                {
-                    "ok": False,
-                    "error": message,
-                    "path": self.path,
-                    "hint": "Create the corresponding service module to enable this route.",
-                },
-                status=501,
-            )
-
         # -----------------------------
         # GET routes
         # -----------------------------
@@ -190,7 +180,7 @@ def create_handler(config: ConfigLike) -> Type[BaseHTTPRequestHandler]:
 
                 if path == "/benchmark/load-path":
                     source_path = self._query_first("path", "").strip()
-                    limit = max(1, min(25000, _safe_int(self._query_first("limit", "1000"), 1000)))
+                    limit = max(1, min(25_000, _safe_int(self._query_first("limit", "1000"), 1000)))
                     if not source_path:
                         self._json({"ok": False, "error": "Missing query parameter: path"}, status=400)
                         return
@@ -202,7 +192,7 @@ def create_handler(config: ConfigLike) -> Type[BaseHTTPRequestHandler]:
                     return
 
                 self._send_not_found()
-            except Exception as exc:  # pragma: no cover - defensive HTTP path
+            except Exception as exc:  # pragma: no cover
                 self._handle_route_exception(exc)
 
         # -----------------------------
@@ -215,7 +205,7 @@ def create_handler(config: ConfigLike) -> Type[BaseHTTPRequestHandler]:
 
                 if path == "/rag/rate":
                     payload = self._read_json_body()
-                    self._json(_rag_rate(config, payload), status=200)
+                    self._json(_rag_rate(config, payload))
                     return
 
                 if path == "/rag/train":
@@ -231,7 +221,7 @@ def create_handler(config: ConfigLike) -> Type[BaseHTTPRequestHandler]:
                 if path == "/benchmark/load-path":
                     payload = self._read_json_body()
                     source_path = str(payload.get("path", "")).strip()
-                    limit = max(1, min(25000, _safe_int(str(payload.get("limit", 1000)), 1000)))
+                    limit = max(1, min(25_000, _safe_int(str(payload.get("limit", 1000)), 1000)))
                     if not source_path:
                         self._json({"ok": False, "error": "Missing JSON field: path"}, status=400)
                         return
@@ -254,7 +244,7 @@ def create_handler(config: ConfigLike) -> Type[BaseHTTPRequestHandler]:
                 self._send_not_found()
             except json.JSONDecodeError:
                 self._json({"ok": False, "error": "Invalid JSON body", "path": self.path}, status=400)
-            except Exception as exc:  # pragma: no cover - defensive HTTP path
+            except Exception as exc:  # pragma: no cover
                 self._handle_route_exception(exc)
 
         # -----------------------------
@@ -263,8 +253,7 @@ def create_handler(config: ConfigLike) -> Type[BaseHTTPRequestHandler]:
         def _serve_index(self) -> None:
             ui_index = config.ui_dir / "index.html"
             if ui_index.exists() and ui_index.is_file():
-                text = ui_index.read_text(encoding="utf-8")
-                self._text(text, content_type="text/html; charset=utf-8")
+                self._text(ui_index.read_text(encoding="utf-8"), content_type="text/html; charset=utf-8")
                 return
             self._text(_fallback_index_html(config), content_type="text/html; charset=utf-8")
 
@@ -282,7 +271,10 @@ def create_handler(config: ConfigLike) -> Type[BaseHTTPRequestHandler]:
                 return
 
             mime, _ = mimetypes.guess_type(str(target))
-            self._bytes(target.read_bytes(), content_type=mime or "application/octet-stream")
+            content_type = mime or "application/octet-stream"
+            if content_type.startswith("text/"):
+                content_type = f"{content_type}; charset=utf-8"
+            self._bytes(target.read_bytes(), content_type=content_type)
 
         def _proxy_to_ollama(self, method: str) -> None:
             parsed = urllib.parse.urlparse(self.path)
@@ -296,12 +288,10 @@ def create_handler(config: ConfigLike) -> Type[BaseHTTPRequestHandler]:
                 body = self.rfile.read(length) if length > 0 else b""
 
             headers: dict[str, str] = {}
-            content_type = self.headers.get("Content-Type")
-            if content_type:
-                headers["Content-Type"] = content_type
-            accept = self.headers.get("Accept")
-            if accept:
-                headers["Accept"] = accept
+            if self.headers.get("Content-Type"):
+                headers["Content-Type"] = str(self.headers["Content-Type"])
+            if self.headers.get("Accept"):
+                headers["Accept"] = str(self.headers["Accept"])
 
             req = urllib.request.Request(target_url, data=body, method=method, headers=headers)
             try:
@@ -342,11 +332,7 @@ def create_handler(config: ConfigLike) -> Type[BaseHTTPRequestHandler]:
                 },
             )
             self._json(
-                {
-                    "ok": False,
-                    "error": f"{type(exc).__name__}: {exc}",
-                    "path": self.path,
-                },
+                {"ok": False, "error": f"{type(exc).__name__}: {exc}", "path": self.path},
                 status=500,
             )
 
@@ -620,7 +606,7 @@ def _benchmark_load_path(config: ConfigLike, source_path: str, *, limit: int = 1
 
         stat = path.stat()
         preview = ""
-        if path.suffix.lower() in {".txt", ".md", ".json", ".csv", ".xml"}:
+        if path.suffix.lower() in {".txt", ".md", ".json", ".jsonl", ".csv", ".xml"}:
             preview = path.read_text(encoding="utf-8", errors="replace")[:4000]
 
         return {
@@ -637,7 +623,7 @@ def _benchmark_load_path(config: ConfigLike, source_path: str, *, limit: int = 1
 
 def _benchmark_load_upload(config: ConfigLike, payload: dict[str, Any]) -> dict[str, Any]:
     filename = str(payload.get("filename", "")).strip() or "upload.txt"
-    limit = max(1, min(25000, _safe_int(str(payload.get("limit", 1000)), 1000)))
+    limit = max(1, min(25_000, _safe_int(str(payload.get("limit", 1000)), 1000)))
 
     raw_data = payload.get("content_base64")
     if raw_data:
@@ -679,7 +665,7 @@ def _benchmark_score(config: ConfigLike, payload: dict[str, Any]) -> dict[str, A
             load_result = _benchmark_load_path(
                 config,
                 source_path,
-                limit=max(1, min(25000, _safe_int(str(payload.get("limit", 1000)), 1000))),
+                limit=max(1, min(25_000, _safe_int(str(payload.get("limit", 1000)), 1000))),
             )
             if not load_result.get("ok"):
                 return load_result
@@ -694,7 +680,8 @@ def _benchmark_score(config: ConfigLike, payload: dict[str, Any]) -> dict[str, A
     predictions = payload.get("predictions")
     pass_threshold = _safe_float(payload.get("pass_threshold"), 0.72)
     strict_count = bool(payload.get("strict_count", False))
-    max_cases = max(1, min(50000, _safe_int(str(payload.get("max_cases", len(prepared_cases))), len(prepared_cases))))
+    max_cases_default = len(prepared_cases) if prepared_cases else 1
+    max_cases = max(1, min(50_000, _safe_int(str(payload.get("max_cases", max_cases_default)), max_cases_default)))
 
     result = score_cases_fn(
         cases=prepared_cases,
@@ -976,7 +963,12 @@ def _parse_txt_case(text: str) -> dict[str, Any] | None:
     if not findings or not impression:
         return None
 
-    return {"findings": findings, "impression": impression, "modality": "unknown", "source": "txt"}
+    return {
+        "findings": findings,
+        "impression": impression,
+        "modality": "unknown",
+        "source": "txt",
+    }
 
 
 def _parse_csv_cases(path: Path) -> list[dict[str, Any]]:
@@ -1013,3 +1005,9 @@ def _parse_csv_cases(path: Path) -> list[dict[str, Any]]:
                     }
                 )
     return items
+
+
+__all__ = [
+    "ConfigLike",
+    "create_handler",
+]
