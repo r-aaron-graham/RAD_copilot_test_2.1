@@ -196,7 +196,6 @@ def list_benchmark_datasets(
                 return discovered
 
             if child.is_dir():
-                # Only surface a directory when it contains at least one supported file.
                 if str(child) in candidate_dirs_seen:
                     continue
                 if _directory_contains_supported_files(child):
@@ -298,15 +297,10 @@ def load_bytes(
         return result
 
 
-# Backwards-compatible aliases for likely server integration names.
 load_benchmark_path = load_path
 load_benchmark_bytes = load_bytes
 list_available_datasets = list_benchmark_datasets
 
-
-# ---------------------------------------------------------------------------
-# Path collection and parsing
-# ---------------------------------------------------------------------------
 
 def _collect_cases_from_path(
     source_path: Path,
@@ -584,10 +578,6 @@ def _iter_tar_records(path: Path, *, stats: BenchmarkLoadStats) -> Iterator[dict
         return
 
 
-# ---------------------------------------------------------------------------
-# Normalization helpers
-# ---------------------------------------------------------------------------
-
 def _mapping_to_case(mapping: Mapping[str, Any], *, source_file: str, source: str) -> dict[str, Any] | None:
     lowered = {str(k).strip().lower(): v for k, v in mapping.items()}
 
@@ -719,10 +709,6 @@ def _metadata_from_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
     return keep
 
 
-# ---------------------------------------------------------------------------
-# Discovery and config helpers
-# ---------------------------------------------------------------------------
-
 def _resolve_dataset_roots(
     *,
     config: ConfigLike | Any | None,
@@ -738,7 +724,6 @@ def _resolve_dataset_roots(
     if benchmark_dir is not None:
         candidates.append(benchmark_dir)
 
-    # Modular config.py path model.
     if config is not None:
         paths = getattr(config, "paths", None)
         if paths is not None:
@@ -752,7 +737,6 @@ def _resolve_dataset_roots(
                 except Exception:
                     continue
 
-    # Compatibility with simpler launcher/server config.
     for attr in ("benchmark_dir", "data_dir", "base_dir"):
         value = getattr(config, attr, None) if config is not None else None
         if not value:
@@ -852,10 +836,6 @@ def _directory_contains_supported_files(path: Path) -> bool:
         return False
     return False
 
-
-# ---------------------------------------------------------------------------
-# Generic text helpers
-# ---------------------------------------------------------------------------
 
 def _read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace")[:MAX_TEXT_READ]
