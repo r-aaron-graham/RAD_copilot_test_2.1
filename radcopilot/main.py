@@ -110,7 +110,7 @@ def log_event(config: AppConfig, event_type: str, detail: object, *, context: st
     try:
         config.log_file.parent.mkdir(parents=True, exist_ok=True)
         entry = {
-            "ts": _dt.datetime.utcnow().isoformat() + "Z",
+            "ts": _dt.datetime.now(_dt.timezone.utc).isoformat().replace("+00:00", "Z"),
             "type": event_type,
             "detail": detail if isinstance(detail, (dict, list)) else str(detail)[:1000],
             "context": context[:200],
