@@ -22,18 +22,17 @@ This module intentionally uses only the Python standard library so it can run
 before the rest of the refactor is complete.
 """
 
+import base64
 import json
 import mimetypes
-import os
 from pathlib import Path
-import tempfile
 import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler
-from typing import Any, Callable, Protocol, Type
+from typing import Any, Protocol, Type
 
 
 class ConfigLike(Protocol):
@@ -63,7 +62,7 @@ def create_handler(config: ConfigLike) -> Type[BaseHTTPRequestHandler]:
     """
 
     class Handler(BaseHTTPRequestHandler):
-        server_version = "RadCopilotLocal/0.2"
+        server_version = "RadCopilotLocal/0.3"
 
         # -----------------------------
         # Generic helpers
@@ -186,15 +185,16 @@ def create_handler(config: ConfigLike) -> Type[BaseHTTPRequestHandler]:
                     return
 
                 if path == "/benchmark/datasets":
-                    self._json({"ok": True, "items": _list_benchmark_datasets(config.data_dir)})
+                    self._json({"ok": True, "items": _list_benchmark_datasets(config)})
                     return
 
                 if path == "/benchmark/load-path":
                     source_path = self._query_first("path", "").strip()
+                    limit = max(1, min(25000, _safe_int(self._query_first("limit", "1000"), 1000)))
                     if not source_path:
                         self._json({"ok": False, "error": "Missing query parameter: path"}, status=400)
                         return
-                    self._json(_benchmark_load_path(config, source_path))
+                    self._json(_benchmark_load_path(config, source_path, limit=limit))
                     return
 
                 if path.startswith("/api/"):
@@ -224,16 +224,23 @@ def create_handler(config: ConfigLike) -> Type[BaseHTTPRequestHandler]:
                     return
 
                 if path == "/benchmark/load":
-                    self._send_not_implemented("Benchmark upload parsing is not implemented in this module yet")
+                    payload = self._read_json_body()
+                    self._json(_benchmark_load_upload(config, payload))
                     return
 
                 if path == "/benchmark/load-path":
                     payload = self._read_json_body()
                     source_path = str(payload.get("path", "")).strip()
+                    limit = max(1, min(25000, _safe_int(str(payload.get("limit", 1000)), 1000)))
                     if not source_path:
                         self._json({"ok": False, "error": "Missing JSON field: path"}, status=400)
                         return
-                    self._json(_benchmark_load_path(config, source_path))
+                    self._json(_benchmark_load_path(config, source_path, limit=limit))
+                    return
+
+                if path == "/benchmark/score":
+                    payload = self._read_json_body()
+                    self._json(_benchmark_score(config, payload))
                     return
 
                 if path == "/whisper/transcribe":
@@ -278,17 +285,17 @@ def create_handler(config: ConfigLike) -> Type[BaseHTTPRequestHandler]:
             self._bytes(target.read_bytes(), content_type=mime or "application/octet-stream")
 
         def _proxy_to_ollama(self, method: str) -> None:
-            target_url = f"{config.ollama_url}{urllib.parse.urlparse(self.path).path}"
-            query = urllib.parse.urlparse(self.path).query
-            if query:
-                target_url = f"{target_url}?{query}"
+            parsed = urllib.parse.urlparse(self.path)
+            target_url = f"{config.ollama_url}{parsed.path}"
+            if parsed.query:
+                target_url = f"{target_url}?{parsed.query}"
 
             body: bytes | None = None
             if method in {"POST", "PUT", "PATCH"}:
                 length = int(self.headers.get("Content-Length", "0") or "0")
                 body = self.rfile.read(length) if length > 0 else b""
 
-            headers = {}
+            headers: dict[str, str] = {}
             content_type = self.headers.get("Content-Type")
             if content_type:
                 headers["Content-Type"] = content_type
@@ -350,6 +357,7 @@ def create_handler(config: ConfigLike) -> Type[BaseHTTPRequestHandler]:
 # Payload builders / service hooks
 # -----------------------------
 
+
 def _health_payload(config: ConfigLike) -> dict[str, Any]:
     return {
         "ok": True,
@@ -363,7 +371,6 @@ def _health_payload(config: ConfigLike) -> dict[str, Any]:
     }
 
 
-
 def _config_payload(config: ConfigLike) -> dict[str, Any]:
     return {
         "app_name": config.app_name,
@@ -375,7 +382,6 @@ def _config_payload(config: ConfigLike) -> dict[str, Any]:
         "data_dir": str(config.data_dir),
         "log_file": str(config.log_file),
     }
-
 
 
 def _rag_status_payload(config: ConfigLike) -> dict[str, Any]:
@@ -403,12 +409,10 @@ def _rag_status_payload(config: ConfigLike) -> dict[str, Any]:
     }
 
 
-
 def _rag_query_payload(config: ConfigLike, *, findings: str, modality: str | None, k: int) -> dict[str, Any]:
     if not findings:
         return {"ok": True, "items": [], "count": 0}
 
-    # Future modular implementation hook.
     try:
         from radcopilot.rag.library import query_records  # type: ignore
 
@@ -417,9 +421,13 @@ def _rag_query_payload(config: ConfigLike, *, findings: str, modality: str | Non
     except ModuleNotFoundError:
         pass
     except Exception as exc:
-        return {"ok": False, "error": f"RAG query module error: {type(exc).__name__}: {exc}", "items": [], "count": 0}
+        return {
+            "ok": False,
+            "error": f"RAG query module error: {type(exc).__name__}: {exc}",
+            "items": [],
+            "count": 0,
+        }
 
-    # Lightweight fallback search against a JSON library file.
     library_file = config.base_dir / "rag_library.json"
     items = _read_json_file(library_file, default=[])
     if not isinstance(items, list):
@@ -449,7 +457,6 @@ def _rag_query_payload(config: ConfigLike, *, findings: str, modality: str | Non
         for score, item in scored[:k]
     ]
     return {"ok": True, "items": best, "count": len(best), "source": "json-fallback"}
-
 
 
 def _rag_rate(config: ConfigLike, payload: dict[str, Any]) -> dict[str, Any]:
@@ -489,13 +496,11 @@ def _rag_rate(config: ConfigLike, payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-
 def _rag_train(config: ConfigLike, payload: dict[str, Any]) -> dict[str, Any]:
     source_path = str(payload.get("path", "")).strip()
     if not source_path:
         return {"ok": False, "error": "Missing JSON field: path"}
 
-    # Future modular implementation hook.
     try:
         from radcopilot.rag.trainer import train_path  # type: ignore
 
@@ -506,7 +511,6 @@ def _rag_train(config: ConfigLike, payload: dict[str, Any]) -> dict[str, Any]:
     except Exception as exc:
         return {"ok": False, "error": f"RAG trainer module error: {type(exc).__name__}: {exc}"}
 
-    # Standard-library fallback: only basic TXT/CSV ingestion for now.
     path = Path(source_path).expanduser().resolve()
     if not path.exists():
         return {"ok": False, "error": f"Path does not exist: {path}"}
@@ -545,9 +549,7 @@ def _rag_train(config: ConfigLike, payload: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-
 def _whisper_transcribe(config: ConfigLike, handler: BaseHTTPRequestHandler) -> dict[str, Any]:
-    # Future modular implementation hook.
     try:
         from radcopilot.services.whisper_service import transcribe_request  # type: ignore
 
@@ -564,165 +566,18 @@ def _whisper_transcribe(config: ConfigLike, handler: BaseHTTPRequestHandler) -> 
     }
 
 
-
-def _benchmark_load_path(config: ConfigLike, source_path: str) -> dict[str, Any]:
-    path = Path(source_path).expanduser().resolve()
-    if not path.exists():
-        return {"ok": False, "error": f"Path does not exist: {path}"}
-
-    if path.is_dir():
-        files = [str(p) for p in sorted(path.iterdir()) if p.is_file()]
-        return {
-            "ok": True,
-            "path": str(path),
-            "kind": "directory",
-            "files": files[:200],
-            "count": len(files),
-        }
-
-    stat = path.stat()
-    preview = ""
-    if path.suffix.lower() in {".txt", ".md", ".json", ".csv", ".xml"}:
-        preview = path.read_text(encoding="utf-8", errors="replace")[:4000]
-
-    return {
-        "ok": True,
-        "path": str(path),
-        "kind": "file",
-        "name": path.name,
-        "suffix": path.suffix.lower(),
-        "size_bytes": stat.st_size,
-        "preview": preview,
-    }
-
-
-# -----------------------------
-# Local helpers
-# -----------------------------
-
-def _fallback_index_html(config: ConfigLike) -> str:
-    return f"""<!DOCTYPE html>
-<html lang=\"en\">
-<head>
-  <meta charset=\"utf-8\">
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-  <title>{config.app_name}</title>
-  <style>
-    body {{
-      margin: 0; font-family: Inter, Arial, sans-serif; background: #0b1220; color: #e5eef8;
-      display: grid; place-items: center; min-height: 100vh;
-    }}
-    .card {{
-      width: min(860px, 92vw); background: #101a2b; border: 1px solid #1f3150;
-      border-radius: 18px; padding: 28px; box-shadow: 0 20px 60px rgba(0,0,0,.35);
-    }}
-    h1 {{ margin-top: 0; font-size: 1.8rem; }}
-    code {{ background: #0b1220; padding: 2px 6px; border-radius: 6px; }}
-    .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 18px; }}
-    .tile {{ background: #0d1728; border: 1px solid #1f3150; border-radius: 12px; padding: 14px; }}
-    a {{ color: #7dd3fc; }}
-    .muted {{ color: #9fb0c9; }}
-  </style>
-</head>
-<body>
-  <main class=\"card\">
-    <h1>{config.app_name}</h1>
-    <p>This modular server is running. The full browser UI has not been moved into <code>ui/index.html</code> yet, so you are seeing the fallback page from <code>radcopilot/server/app.py</code>.</p>
-    <div class=\"grid\">
-      <section class=\"tile\"><strong>Server</strong><p class=\"muted\">{config.base_url}</p></section>
-      <section class=\"tile\"><strong>Ollama</strong><p class=\"muted\">{config.ollama_url}</p></section>
-      <section class=\"tile\"><strong>RAG Data Dir</strong><p class=\"muted\">{config.data_dir}</p></section>
-      <section class=\"tile\"><strong>Log File</strong><p class=\"muted\">{config.log_file}</p></section>
-    </div>
-    <p style=\"margin-top: 18px;\">
-      <a href=\"/health\">/health</a> ·
-      <a href=\"/config\">/config</a> ·
-      <a href=\"/rag/status\">/rag/status</a> ·
-      <a href=\"/benchmark/datasets\">/benchmark/datasets</a>
-    </p>
-  </main>
-</body>
-</html>
-"""
-
-
-
-def _ollama_available(ollama_url: str, timeout: float = 2.0) -> bool:
+def _list_benchmark_datasets(config: ConfigLike) -> list[dict[str, Any]]:
     try:
-        urllib.request.urlopen(f"{ollama_url.rstrip('/')}/api/tags", timeout=timeout)
-        return True
+        list_fn = _get_benchmark_loader_symbol("list_benchmark_datasets")
+        items = list_fn(config=config)
+        return items if isinstance(items, list) else []
     except Exception:
-        return False
+        pass
 
-
-
-def _whisper_available() -> bool:
-    try:
-        import whisper  # noqa: F401
-
-        return True
-    except Exception:
-        return False
-
-
-
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-
-def _safe_int(value: str, default: int) -> int:
-    try:
-        return int(value)
-    except Exception:
-        return default
-
-
-
-def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
-
-
-
-def _tail_jsonl(path: Path, limit: int) -> list[dict[str, Any]]:
-    if not path.exists() or not path.is_file():
-        return []
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]
-    items: list[dict[str, Any]] = []
-    for line in reversed(lines):
-        try:
-            obj = json.loads(line)
-            if isinstance(obj, dict):
-                items.append(obj)
-        except Exception:
-            items.append({"raw": line})
-    return items
-
-
-
-def _read_json_file(path: Path, default: Any) -> Any:
-    if not path.exists() or not path.is_file():
-        return default
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default
-
-
-
-def _count_lines(path: Path) -> int:
-    if not path.exists() or not path.is_file():
-        return 0
-    with path.open("r", encoding="utf-8", errors="replace") as fh:
-        return sum(1 for _ in fh)
-
-
-
-def _list_benchmark_datasets(data_dir: Path) -> list[dict[str, Any]]:
+    data_dir = config.data_dir
     if not data_dir.exists() or not data_dir.is_dir():
         return []
+
     items: list[dict[str, Any]] = []
     for path in sorted(data_dir.rglob("*")):
         if not path.is_file():
@@ -743,6 +598,300 @@ def _list_benchmark_datasets(data_dir: Path) -> list[dict[str, Any]]:
     return items
 
 
+def _benchmark_load_path(config: ConfigLike, source_path: str, *, limit: int = 1000) -> dict[str, Any]:
+    try:
+        load_path_fn = _get_benchmark_loader_symbol("load_path")
+        return load_path_fn(config=config, path=source_path, limit=limit)
+    except Exception as exc:
+        path = Path(source_path).expanduser().resolve()
+        if not path.exists():
+            return {"ok": False, "error": f"Path does not exist: {path}"}
+
+        if path.is_dir():
+            files = [str(p) for p in sorted(path.iterdir()) if p.is_file()]
+            return {
+                "ok": True,
+                "path": str(path),
+                "kind": "directory",
+                "files": files[:200],
+                "count": len(files),
+                "warning": f"Benchmark loader unavailable, falling back to directory listing: {type(exc).__name__}: {exc}",
+            }
+
+        stat = path.stat()
+        preview = ""
+        if path.suffix.lower() in {".txt", ".md", ".json", ".csv", ".xml"}:
+            preview = path.read_text(encoding="utf-8", errors="replace")[:4000]
+
+        return {
+            "ok": True,
+            "path": str(path),
+            "kind": "file",
+            "name": path.name,
+            "suffix": path.suffix.lower(),
+            "size_bytes": stat.st_size,
+            "preview": preview,
+            "warning": f"Benchmark loader unavailable, falling back to file preview: {type(exc).__name__}: {exc}",
+        }
+
+
+def _benchmark_load_upload(config: ConfigLike, payload: dict[str, Any]) -> dict[str, Any]:
+    filename = str(payload.get("filename", "")).strip() or "upload.txt"
+    limit = max(1, min(25000, _safe_int(str(payload.get("limit", 1000)), 1000)))
+
+    raw_data = payload.get("content_base64")
+    if raw_data:
+        try:
+            data = base64.b64decode(str(raw_data), validate=True)
+        except Exception as exc:
+            return {"ok": False, "error": f"Invalid content_base64 payload: {type(exc).__name__}: {exc}"}
+    else:
+        content = payload.get("content", "")
+        if isinstance(content, str):
+            data = content.encode("utf-8")
+        else:
+            return {"ok": False, "error": "Missing content or content_base64"}
+
+    try:
+        load_bytes_fn = _get_benchmark_loader_symbol("load_bytes")
+        return load_bytes_fn(config=config, filename=filename, data=data, limit=limit)
+    except Exception as exc:
+        return {
+            "ok": False,
+            "error": f"Benchmark upload parsing is unavailable: {type(exc).__name__}: {exc}",
+        }
+
+
+def _benchmark_score(config: ConfigLike, payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        score_cases_fn = _get_benchmark_scorer_symbol("score_cases")
+    except Exception as exc:
+        return {"ok": False, "error": f"Benchmark scorer unavailable: {type(exc).__name__}: {exc}"}
+
+    cases: list[dict[str, Any]] = []
+    if isinstance(payload.get("cases"), list):
+        cases = [dict(item) for item in payload["cases"] if isinstance(item, dict)]
+    elif isinstance(payload.get("items"), list):
+        cases = [dict(item) for item in payload["items"] if isinstance(item, dict)]
+    else:
+        source_path = str(payload.get("path", "")).strip()
+        if source_path:
+            load_result = _benchmark_load_path(
+                config,
+                source_path,
+                limit=max(1, min(25000, _safe_int(str(payload.get("limit", 1000)), 1000))),
+            )
+            if not load_result.get("ok"):
+                return load_result
+            loaded_items = load_result.get("items", [])
+            if isinstance(loaded_items, list):
+                cases = [dict(item) for item in loaded_items if isinstance(item, dict)]
+
+    if not cases:
+        return {"ok": False, "error": "No benchmark cases available to score"}
+
+    prepared_cases = [_normalize_benchmark_case_for_scoring(case) for case in cases]
+    predictions = payload.get("predictions")
+    pass_threshold = _safe_float(payload.get("pass_threshold"), 0.72)
+    strict_count = bool(payload.get("strict_count", False))
+    max_cases = max(1, min(50000, _safe_int(str(payload.get("max_cases", len(prepared_cases))), len(prepared_cases))))
+
+    result = score_cases_fn(
+        cases=prepared_cases,
+        predictions=predictions,
+        pass_threshold=pass_threshold,
+        strict_count=strict_count,
+        max_cases=max_cases,
+    )
+    if isinstance(result, dict):
+        return result
+    return {"ok": False, "error": "Benchmark scorer returned an unexpected result type"}
+
+
+# -----------------------------
+# Benchmark helpers
+# -----------------------------
+
+
+def _get_benchmark_loader_symbol(name: str) -> Any:
+    try:
+        from radcopilot.benchmark import loader as loader_module  # type: ignore
+    except Exception:
+        from ..benchmark import loader as loader_module  # type: ignore
+    return getattr(loader_module, name)
+
+
+def _get_benchmark_scorer_symbol(name: str) -> Any:
+    try:
+        from radcopilot.benchmark import scorer as scorer_module  # type: ignore
+    except Exception:
+        from ..benchmark import scorer as scorer_module  # type: ignore
+    return getattr(scorer_module, name)
+
+
+def _normalize_benchmark_case_for_scoring(case: dict[str, Any]) -> dict[str, Any]:
+    prepared = dict(case)
+    if _case_has_prediction(prepared):
+        return prepared
+
+    metadata = prepared.get("metadata", {})
+    if not isinstance(metadata, dict):
+        return prepared
+
+    for key in (
+        "predicted_text",
+        "prediction",
+        "generated_impression",
+        "generated_text",
+        "output",
+        "result",
+        "response",
+    ):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            prepared["prediction"] = value.strip()
+            break
+    return prepared
+
+
+def _case_has_prediction(case: dict[str, Any]) -> bool:
+    for key in (
+        "predicted_text",
+        "prediction",
+        "generated_impression",
+        "generated_text",
+        "output",
+        "result",
+        "response",
+    ):
+        value = case.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
+# -----------------------------
+# Local helpers
+# -----------------------------
+
+
+def _fallback_index_html(config: ConfigLike) -> str:
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{config.app_name}</title>
+  <style>
+    body {{
+      margin: 0; font-family: Inter, Arial, sans-serif; background: #0b1220; color: #e5eef8;
+      display: grid; place-items: center; min-height: 100vh;
+    }}
+    .card {{
+      width: min(860px, 92vw); background: #101a2b; border: 1px solid #1f3150;
+      border-radius: 18px; padding: 28px; box-shadow: 0 20px 60px rgba(0,0,0,.35);
+    }}
+    h1 {{ margin-top: 0; font-size: 1.8rem; }}
+    code {{ background: #0b1220; padding: 2px 6px; border-radius: 6px; }}
+    .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 18px; }}
+    .tile {{ background: #0d1728; border: 1px solid #1f3150; border-radius: 12px; padding: 14px; }}
+    a {{ color: #7dd3fc; }}
+    .muted {{ color: #9fb0c9; }}
+  </style>
+</head>
+<body>
+  <main class="card">
+    <h1>{config.app_name}</h1>
+    <p>This modular server is running. The full browser UI has not been moved into <code>ui/index.html</code> yet, so you are seeing the fallback page from <code>radcopilot/server/app.py</code>.</p>
+    <div class="grid">
+      <section class="tile"><strong>Server</strong><p class="muted">{config.base_url}</p></section>
+      <section class="tile"><strong>Ollama</strong><p class="muted">{config.ollama_url}</p></section>
+      <section class="tile"><strong>RAG Data Dir</strong><p class="muted">{config.data_dir}</p></section>
+      <section class="tile"><strong>Log File</strong><p class="muted">{config.log_file}</p></section>
+    </div>
+    <p style="margin-top: 18px;">
+      <a href="/health">/health</a> ·
+      <a href="/config">/config</a> ·
+      <a href="/rag/status">/rag/status</a> ·
+      <a href="/benchmark/datasets">/benchmark/datasets</a>
+    </p>
+  </main>
+</body>
+</html>
+"""
+
+
+def _ollama_available(ollama_url: str, timeout: float = 2.0) -> bool:
+    try:
+        urllib.request.urlopen(f"{ollama_url.rstrip('/')}/api/tags", timeout=timeout)
+        return True
+    except Exception:
+        return False
+
+
+def _whisper_available() -> bool:
+    try:
+        import whisper  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _safe_int(value: str, default: int) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _safe_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _tail_jsonl(path: Path, limit: int) -> list[dict[str, Any]]:
+    if not path.exists() or not path.is_file():
+        return []
+    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()[-limit:]
+    items: list[dict[str, Any]] = []
+    for line in reversed(lines):
+        try:
+            obj = json.loads(line)
+            if isinstance(obj, dict):
+                items.append(obj)
+        except Exception:
+            items.append({"raw": line})
+    return items
+
+
+def _read_json_file(path: Path, default: Any) -> Any:
+    if not path.exists() or not path.is_file():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def _count_lines(path: Path) -> int:
+    if not path.exists() or not path.is_file():
+        return 0
+    with path.open("r", encoding="utf-8", errors="replace") as fh:
+        return sum(1 for _ in fh)
+
 
 def _format_examples_block(items: list[dict[str, Any]]) -> str:
     parts: list[str] = []
@@ -757,11 +906,9 @@ def _format_examples_block(items: list[dict[str, Any]]) -> str:
     return "\n\nReal radiologist examples for similar cases:\n\n" + "\n\n".join(parts)
 
 
-
 def _tokenize(text: str) -> set[str]:
     cleaned = "".join(ch.lower() if ch.isalnum() else " " for ch in text)
     return {tok for tok in cleaned.split() if len(tok) >= 2}
-
 
 
 def _jaccard(a: set[str], b: set[str]) -> float:
@@ -771,7 +918,6 @@ def _jaccard(a: set[str], b: set[str]) -> float:
     if not union:
         return 0.0
     return len(a & b) / len(union)
-
 
 
 def _add_rag_record(config: ConfigLike, record: dict[str, Any]) -> bool:
@@ -805,7 +951,6 @@ def _add_rag_record(config: ConfigLike, record: dict[str, Any]) -> bool:
     return True
 
 
-
 def _parse_txt_case(text: str) -> dict[str, Any] | None:
     upper = text.upper()
     findings_idx = upper.find("FINDINGS")
@@ -816,7 +961,12 @@ def _parse_txt_case(text: str) -> dict[str, Any] | None:
         return None
 
     end_idx = impression_idx if impression_idx != -1 else conclusion_idx
-    findings = text[findings_idx:end_idx].split(":", 1)[-1].strip() if end_idx != -1 else text[findings_idx:].split(":", 1)[-1].strip()
+    findings = (
+        text[findings_idx:end_idx].split(":", 1)[-1].strip()
+        if end_idx != -1
+        else text[findings_idx:].split(":", 1)[-1].strip()
+    )
+
     impression = ""
     if impression_idx != -1:
         impression = text[impression_idx:].split(":", 1)[-1].strip()
@@ -825,8 +975,8 @@ def _parse_txt_case(text: str) -> dict[str, Any] | None:
 
     if not findings or not impression:
         return None
-    return {"findings": findings, "impression": impression, "modality": "unknown", "source": "txt"}
 
+    return {"findings": findings, "impression": impression, "modality": "unknown", "source": "txt"}
 
 
 def _parse_csv_cases(path: Path) -> list[dict[str, Any]]:
@@ -863,4 +1013,3 @@ def _parse_csv_cases(path: Path) -> list[dict[str, Any]]:
                     }
                 )
     return items
-
