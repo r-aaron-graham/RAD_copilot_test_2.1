@@ -135,6 +135,10 @@ def create_handler(config: ConfigLike) -> Type[BaseHTTPRequestHandler]:
                     self._serve_index()
                     return
 
+                if path in {"/style.css", "/templates.js", "/app.js"}:
+                    self._serve_static(f"/static{path}")
+                    return
+
                 if path.startswith("/static/"):
                     self._serve_static(path)
                     return
