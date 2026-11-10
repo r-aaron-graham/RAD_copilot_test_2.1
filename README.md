@@ -2,6 +2,24 @@
 
 RadCopilot Local is a local-first radiology AI workstation packaged as a modular Python application. It launches a local web server, opens a browser-based interface, uses a local Ollama model for inference, can optionally use Whisper for speech-to-text dictation, and supports report drafting, differential diagnosis, guideline lookup, benchmarking, retrieval-augmented generation (RAG), feedback capture, and local history.
 
+## Reviewer demo
+
+This is a local engineering prototype. Use synthetic data for demonstrations.
+
+From a clean checkout, run this smoke test with Python 3.10 or later:
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+The test starts two loopback HTTP servers on temporary ports. It fetches the
+page and its CSS and JavaScript, lists a fixture model, and sends the synthetic
+text `Synthetic test input.` through the app's Ollama adapter. The expected
+reply is `Synthetic fixture response.` No model download, API key, patient
+data, or third-party package is needed. The fixture checks HTTP wiring and
+static assets. Model quality, dictation, and clinical validity are outside
+this demo.
+
 ## Highlights
 
 - Local browser UI served by Python
